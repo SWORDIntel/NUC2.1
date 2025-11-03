@@ -5,7 +5,7 @@
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/uaccess.h>
-#include <linux/eventfd.h>
+#include <linux/io_uring.h>
 
 #define VENDOR_ID_INTEL 0x03e7
 #define PRODUCT_ID_MYRIAD_X 0x2485
@@ -34,16 +34,6 @@ enum movidius_urb_direction {
     MOVIDIUS_URB_IN,
 };
 
-struct internal_inference_request {
-    struct list_head list;
-    size_t input_offset;
-    size_t input_size;
-    size_t output_offset;
-    size_t output_size;
-    int eventfd;
-    u64 seq;
-    struct eventfd_ctx *eventfd_ctx;
-};
 
 struct movidius_urb {
     struct urb *urb;
@@ -54,13 +44,11 @@ struct movidius_urb {
 };
 
 struct inference_request {
-    struct list_head list;
     size_t input_offset;
     size_t input_size;
     size_t output_offset;
     size_t output_size;
-    int eventfd;
-    u64 seq;
+    u64 user_data;
 };
 
 #define DMA_BUFFER_SIZE (4 * 1024 * 1024) // 4MB
@@ -223,8 +211,7 @@ static void movidius_x_vpu_urb_complete(struct urb *urb)
 
     if (urb->status) {
         printk(KERN_ERR "URB completed with status %d\n", urb->status);
-        eventfd_signal(req->eventfd_ctx, 1);
-        eventfd_ctx_put(req->eventfd_ctx);
+        io_uring_cmd_done(req->ioucmd, urb->status, 0);
         kfree(req);
         return_urb_to_pool(dev, movidius_urb);
         return;
@@ -244,15 +231,13 @@ static void movidius_x_vpu_urb_complete(struct urb *urb)
         ret = usb_submit_urb(movidius_urb->urb, GFP_KERNEL);
         if (ret) {
             printk(KERN_ERR "Failed to submit bulk in URB: %d\n", ret);
-            eventfd_signal(req->eventfd_ctx, 1);
-            eventfd_ctx_put(req->eventfd_ctx);
+            io_uring_cmd_done(req->ioucmd, ret, 0);
             kfree(req);
             return_urb_to_pool(dev, movidius_urb);
         }
     } else {
-        printk(KERN_INFO "Inference complete: seq=%llu\n", req->seq);
-        eventfd_signal(req->eventfd_ctx, req->seq);
-        eventfd_ctx_put(req->eventfd_ctx);
+        printk(KERN_INFO "Inference complete\n");
+        io_uring_cmd_done(req->ioucmd, 0, 0);
         kfree(req);
         return_urb_to_pool(dev, movidius_urb);
     }
@@ -311,46 +296,40 @@ static int movidius_x_vpu_mmap(struct file *file, struct vm_area_struct *vma)
     return 0;
 }
 
+enum {
+    MOVIDIUS_URING_CMD_SUBMIT_INFERENCE,
+};
+
 struct internal_inference_request {
     struct list_head list;
+    struct io_uring_cmd *ioucmd;
     size_t input_offset;
     size_t input_size;
     size_t output_offset;
     size_t output_size;
-    int eventfd;
-    u64 seq;
-    struct eventfd_ctx *eventfd_ctx;
+    u64 user_data;
 };
 
-#define MOVIDIUS_IOCTL_SUBMIT_INFERENCE _IOW('m', 1, struct inference_request)
-
-static long movidius_x_vpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
 {
-    struct movidius_x_vpu_dev *dev = file->private_data;
+    struct movidius_x_vpu_dev *dev = ioucmd->file->private_data;
     struct internal_inference_request *req;
+    const struct inference_request __user *user_req = (const struct inference_request __user *)(uintptr_t)ioucmd->cmd.addr;
     unsigned long flags;
-    struct inference_request user_req;
 
-    switch (cmd) {
-    case MOVIDIUS_IOCTL_SUBMIT_INFERENCE:
-        if (copy_from_user(&user_req, (void __user *)arg, sizeof(user_req)))
-            return -EFAULT;
-
+    switch (ioucmd->cmd.opcode) {
+    case MOVIDIUS_URING_CMD_SUBMIT_INFERENCE:
         req = kzalloc(sizeof(*req), GFP_KERNEL);
         if (!req)
             return -ENOMEM;
 
-        req->input_offset = user_req.input_offset;
-        req->input_size = user_req.input_size;
-        req->output_offset = user_req.output_offset;
-        req->output_size = user_req.output_size;
-        req->eventfd = user_req.eventfd;
-        req->seq = user_req.seq;
-        req->eventfd_ctx = eventfd_ctx_fdget(user_req.eventfd);
-        if (IS_ERR(req->eventfd_ctx)) {
+        if (copy_from_user(&req->input_offset, user_req, sizeof(struct inference_request))) {
             kfree(req);
-            return PTR_ERR(req->eventfd_ctx);
+            return -EFAULT;
         }
+
+        req->ioucmd = ioucmd;
+        io_uring_cmd_set_user_data(ioucmd, req->user_data);
 
         spin_lock_irqsave(&dev->request_queue_lock, flags);
         list_add_tail(&req->list, &dev->request_queue);
@@ -359,7 +338,7 @@ static long movidius_x_vpu_ioctl(struct file *file, unsigned int cmd, unsigned l
         wake_up_interruptible(&dev->request_queue_wait);
         break;
     default:
-        return -ENOTTY;
+        return -EOPNOTSUPP;
     }
 
     return 0;
@@ -370,7 +349,7 @@ static const struct file_operations movidius_x_vpu_fops = {
     .open = movidius_x_vpu_open,
     .release = movidius_x_vpu_release,
     .mmap = movidius_x_vpu_mmap,
-    .unlocked_ioctl = movidius_x_vpu_ioctl,
+    .io_uring_cmd = movidius_x_vpu_uring_cmd,
 };
 
 static int movidius_x_vpu_probe(struct usb_interface *interface, const struct usb_device_id *id)
@@ -458,16 +437,6 @@ error:
     return ret;
 }
 
-static void free_request_queue(struct movidius_x_vpu_dev *dev)
-{
-    struct internal_inference_request *req, *tmp;
-    list_for_each_entry_safe(req, tmp, &dev->request_queue, list) {
-        list_del(&req->list);
-        eventfd_ctx_put(req->eventfd_ctx);
-        kfree(req);
-    }
-}
-
 static void movidius_x_vpu_disconnect(struct usb_interface *interface)
 {
     struct movidius_x_vpu_dev *dev = usb_get_intfdata(interface);
@@ -475,7 +444,6 @@ static void movidius_x_vpu_disconnect(struct usb_interface *interface)
     printk(KERN_INFO "Movidius Myriad X VPU device unplugged\n");
 
     stop_submission_thread(dev);
-    free_request_queue(dev);
     urb_pool_free(dev);
     usb_free_coherent(dev->udev, DMA_BUFFER_SIZE, dev->dma_buffer, dev->dma_handle);
     device_destroy(movidius_class, dev_num);
