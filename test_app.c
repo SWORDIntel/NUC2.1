@@ -5,10 +5,13 @@
 #include <sys/mman.h>
 #include <string.h>
 #include <stdint.h>
+#include <dirent.h>
 #include <liburing.h>
 
 #define DMA_BUFFER_SIZE (4 * 1024 * 1024)
 #define MAX_SG_SEGMENTS 16
+
+#define MOVIDIUS_UAPI_VERSION 1
 
 enum {
     MOVIDIUS_URING_CMD_SUBMIT_INFERENCE,
@@ -20,7 +23,14 @@ struct movidius_sg_segment {
     uint32_t len;
 };
 
+struct movidius_cmd_hdr {
+    uint16_t version;
+    uint16_t op;
+    uint32_t len;
+};
+
 struct inference_request {
+    struct movidius_cmd_hdr hdr;
     uint32_t num_input_segs;
     uint32_t num_output_segs;
     struct movidius_sg_segment input_segs[MAX_SG_SEGMENTS];
@@ -28,15 +38,40 @@ struct inference_request {
     uint64_t user_data;
 };
 
-int main()
+void list_devices()
 {
-    int fd, i, ret;
+    DIR *d;
+    struct dirent *dir;
+    d = opendir("/dev");
+    if (d) {
+        while ((dir = readdir(d)) != NULL) {
+            if (strncmp(dir->d_name, "movidius_x_vpu", 14) == 0) {
+                printf("/dev/%s\n", dir->d_name);
+            }
+        }
+        closedir(d);
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    int fd, ret;
     void *dma_buffer;
     struct io_uring ring;
     struct inference_request *req;
+    char *dev_name = "/dev/movidius_x_vpu0";
 
-    printf("Opening /dev/movidius_x_vpu...\n");
-    fd = open("/dev/movidius_x_vpu", O_RDWR);
+    if (argc > 1 && strcmp(argv[1], "--list") == 0) {
+        list_devices();
+        return EXIT_SUCCESS;
+    }
+
+    if (argc > 1) {
+        dev_name = argv[1];
+    }
+
+    printf("Opening %s...\n", dev_name);
+    fd = open(dev_name, O_RDWR);
     if (fd < 0) {
         perror("Failed to open the device");
         return EXIT_FAILURE;
@@ -44,7 +79,7 @@ int main()
 
     printf("Device opened successfully.\n");
 
-    dma_buffer = mmap(NULL, DMA_BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    dma_buffer = mmap(NULL, dma_buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (dma_buffer == MAP_FAILED) {
         perror("mmap failed");
         close(fd);
@@ -65,24 +100,16 @@ int main()
         return EXIT_FAILURE;
     }
 
-    /* Prepare a request with 2 input segments and 1 output segment */
-    req->num_input_segs = 2;
+    req->hdr.version = MOVIDIUS_UAPI_VERSION;
+    req->hdr.op = MOVIDIUS_URING_CMD_SUBMIT_INFERENCE;
+    req->hdr.len = sizeof(*req);
+    req->num_input_segs = 1;
     req->num_output_segs = 1;
-
-    /* First input segment */
-    strcpy(dma_buffer, "Hello from ");
+    strcpy(dma_buffer, "Hello from user space!");
     req->input_segs[0].offset = 0;
-    req->input_segs[0].len = strlen("Hello from ");
-
-    /* Second input segment */
-    strcpy(dma_buffer + 1024, "user space!");
-    req->input_segs[1].offset = 1024;
-    req->input_segs[1].len = strlen("user space!");
-
-    /* Output segment */
-    req->output_segs[0].offset = 2048;
+    req->input_segs[0].len = strlen("Hello from user space!");
+    req->output_segs[0].offset = 1024;
     req->output_segs[0].len = 128;
-
     req->user_data = 1;
 
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
@@ -112,7 +139,7 @@ int main()
 
     free(req);
 
-    if (munmap(dma_buffer, DMA_BUFFER_SIZE) == -1) {
+    if (munmap(dma_buffer, dma_buf_size) == -1) {
         perror("munmap failed");
     }
 

@@ -75,6 +75,20 @@ To run the test application, simply execute the `test_app` binary:
 
 The test application will submit a batch of inference requests to the driver and print a message to the console when each request is complete.
 
+To list the available devices, use the `--list` command-line option:
+
+```bash
+./test_app --list
+```
+
+### udev Rule
+
+To allow non-root users to access the device, you can add the following `udev` rule to `/etc/udev/rules.d/99-movidius.rules`:
+
+```
+SUBSYSTEM=="usb", ATTR{idVendor}=="03e7", ATTR{idProduct}=="2485", MODE="0660", GROUP="plugdev", SYMLINK+="movidius_x_vpu%n"
+```
+
 ## Scatter-Gather DMA
 
 The driver supports scatter-gather DMA, which allows a single inference request to be composed of multiple, non-contiguous memory buffers. This is useful for complex neural networks where different inputs or layers may be prepared in separate memory regions.

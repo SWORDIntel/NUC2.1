@@ -9,12 +9,31 @@
 #include <linux/moduleparam.h>
 #include <linux/interrupt.h>
 #include <linux/scatterlist.h>
+#include <linux/version.h>
 
-#define VENDOR_ID_INTEL 0x03e7
-#define PRODUCT_ID_MYRIAD_X 0x2485
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
+#error "movidius_x_vpu needs >= 5.12 for io_uring_cmd"
+#endif
+
+#include <linux/firmware.h>
+#include <linux/pm_runtime.h>
+
+#define MOVIDIUS_UAPI_VERSION 1
+
+static ushort vid = 0x03e7;
+module_param(vid, ushort, 0444);
+MODULE_PARM_DESC(vid, "USB Vendor ID (default 0x03e7)");
+
+static ushort pid = 0x2485;
+module_param(pid, ushort, 0444);
+MODULE_PARM_DESC(pid, "USB Product ID (default 0x2485)");
+
+static ulong dma_buf_size = 4UL * 1024 * 1024; /* 4 MiB default */
+module_param(dma_buf_size, ulong, 0644);
+MODULE_PARM_DESC(dma_buf_size, "DMA buffer size in bytes");
 
 static struct usb_device_id movidius_x_vpu_table[] = {
-    { USB_DEVICE(VENDOR_ID_INTEL, PRODUCT_ID_MYRIAD_X) },
+    { USB_DEVICE(vid, pid) },
     {} /* Terminating entry */
 };
 MODULE_DEVICE_TABLE(usb, movidius_x_vpu_table);
@@ -27,10 +46,13 @@ static int irq_cpu = -1;
 module_param(irq_cpu, int, 0644);
 MODULE_PARM_DESC(irq_cpu, "The CPU to affinitize USB interrupts to. -1 for unbound.");
 
-#define MAX_DEV 1
+static char *fw_name = "movidius-x-vpu.fw";
+module_param(fw_name, charp, 0444);
+MODULE_PARM_DESC(fw_name, "The name of the firmware file to load.");
 
 static dev_t dev_num;
 static struct class *movidius_class;
+static DEFINE_IDR(movidius_idr);
 static struct cdev movidius_cdev;
 
 #define URB_POOL_SIZE 16
@@ -61,7 +83,14 @@ struct movidius_sg_segment {
     __u32 len;
 };
 
+struct movidius_cmd_hdr {
+    __u16 version;
+    __u16 op;
+    __u32 len;
+};
+
 struct inference_request {
+    struct movidius_cmd_hdr hdr;
     __u32 num_input_segs;
     __u32 num_output_segs;
     struct movidius_sg_segment input_segs[MAX_SG_SEGMENTS];
@@ -69,9 +98,8 @@ struct inference_request {
     u64 user_data;
 };
 
-#define DMA_BUFFER_SIZE (4 * 1024 * 1024) // 4MB
-
 struct movidius_x_vpu_dev {
+    struct device *dev;
     struct usb_device *udev;
     struct cdev cdev;
     struct urb_pool urb_pool;
@@ -84,6 +112,9 @@ struct movidius_x_vpu_dev {
     u8 bulk_in_endpoint_addr;
     u8 bulk_out_endpoint_addr;
     atomic_t pending_reqs;
+    atomic_t completed_reqs;
+    atomic_t reset_count;
+    struct kobject kobj;
 };
 
 static void urb_pool_free(struct movidius_x_vpu_dev *dev); // Forward declaration
@@ -241,14 +272,15 @@ static void movidius_x_vpu_urb_complete(struct urb *urb)
     struct movidius_x_vpu_dev *dev = movidius_urb->dev;
     struct internal_inference_request *req = movidius_urb->req;
     int ret;
+    u64 count;
 
     if (urb->status) {
         printk(KERN_ERR "URB completed with status %d\n", urb->status);
         kfree(req->sg);
-        if (atomic_dec_and_test(&req->batch->pending_reqs)) {
+        count = io_uring_cmd_get_user_data(req->ioucmd);
+        if (atomic_dec_and_test((atomic_t *)&count))
             io_uring_cmd_done(req->ioucmd, urb->status, 0);
-            kfree(req->batch);
-        }
+        atomic_inc(&dev->completed_reqs);
         kfree(req);
         return_urb_to_pool(dev, movidius_urb);
         return;
@@ -261,10 +293,9 @@ static void movidius_x_vpu_urb_complete(struct urb *urb)
 
         req->sg = kcalloc(req->num_output_segs, sizeof(struct scatterlist), GFP_KERNEL);
         if (!req->sg) {
-            if (atomic_dec_and_test(&req->batch->pending_reqs)) {
+            count = io_uring_cmd_get_user_data(req->ioucmd);
+            if (atomic_dec_and_test((atomic_t *)&count))
                 io_uring_cmd_done(req->ioucmd, -ENOMEM, 0);
-                kfree(req->batch);
-            }
             kfree(req);
             return_urb_to_pool(dev, movidius_urb);
             return;
@@ -290,20 +321,19 @@ static void movidius_x_vpu_urb_complete(struct urb *urb)
         if (ret) {
             printk(KERN_ERR "Failed to submit bulk in URB: %d\n", ret);
             kfree(req->sg);
-            if (atomic_dec_and_test(&req->batch->pending_reqs)) {
+            count = io_uring_cmd_get_user_data(req->ioucmd);
+            if (atomic_dec_and_test((atomic_t *)&count))
                 io_uring_cmd_done(req->ioucmd, ret, 0);
-                kfree(req->batch);
-            }
             kfree(req);
             return_urb_to_pool(dev, movidius_urb);
         }
     } else {
         printk(KERN_INFO "Inference complete\n");
         kfree(req->sg);
-        if (atomic_dec_and_test(&req->batch->pending_reqs)) {
+        count = io_uring_cmd_get_user_data(req->ioucmd);
+        if (atomic_dec_and_test((atomic_t *)&count))
             io_uring_cmd_done(req->ioucmd, 0, 0);
-            kfree(req->batch);
-        }
+        atomic_inc(&dev->completed_reqs);
         kfree(req);
         return_urb_to_pool(dev, movidius_urb);
     }
@@ -346,7 +376,7 @@ static int movidius_x_vpu_mmap(struct file *file, struct vm_area_struct *vma)
     unsigned long size = vma->vm_end - vma->vm_start;
     unsigned long pfn;
 
-    if (size > DMA_BUFFER_SIZE)
+    if (size > dma_buf_size)
         return -EINVAL;
 
     pfn = virt_to_phys(dev->dma_buffer) >> PAGE_SHIFT;
@@ -368,14 +398,10 @@ enum {
 };
 
 struct batch_inference_request {
+    struct movidius_cmd_hdr hdr;
     __u32 count;
     __u32 pad;
     __u64 reqs;
-};
-
-struct batch_completion {
-    struct completion completion;
-    atomic_t pending_reqs;
 };
 
 struct internal_inference_request {
@@ -387,7 +413,6 @@ struct internal_inference_request {
     struct movidius_sg_segment output_segs[MAX_SG_SEGMENTS];
     u64 user_data;
     struct scatterlist *sg;
-    struct batch_completion *batch;
 };
 
 static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
@@ -400,7 +425,13 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
     case MOVIDIUS_URING_CMD_SUBMIT_INFERENCE: {
         const struct inference_request __user *user_req = (const struct inference_request __user *)(uintptr_t)ioucmd->cmd.addr;
         int i;
-        struct batch_completion *batch;
+        struct movidius_cmd_hdr hdr;
+
+        if (copy_from_user(&hdr, user_req, sizeof(hdr)))
+            return -EFAULT;
+
+        if (hdr.version != MOVIDIUS_UAPI_VERSION)
+            return -EINVAL;
 
         req = kzalloc(sizeof(*req), GFP_KERNEL);
         if (!req)
@@ -417,30 +448,22 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
         }
 
         for (i = 0; i < req->num_input_segs; i++) {
-            if (req->input_segs[i].offset + req->input_segs[i].len > DMA_BUFFER_SIZE) {
+            if (req->input_segs[i].offset + req->input_segs[i].len > dma_buf_size) {
                 kfree(req);
                 return -EINVAL;
             }
         }
 
         for (i = 0; i < req->num_output_segs; i++) {
-            if (req->output_segs[i].offset + req->output_segs[i].len > DMA_BUFFER_SIZE) {
+            if (req->output_segs[i].offset + req->output_segs[i].len > dma_buf_size) {
                 kfree(req);
                 return -EINVAL;
             }
         }
 
-        batch = kzalloc(sizeof(*batch), GFP_KERNEL);
-        if (!batch) {
-            kfree(req);
-            return -ENOMEM;
-        }
-        init_completion(&batch->completion);
-        atomic_set(&batch->pending_reqs, 1);
-        req->batch = batch;
-
         req->ioucmd = ioucmd;
-        io_uring_cmd_set_user_data(ioucmd, req->user_data);
+        atomic_inc(&dev->pending_reqs);
+        io_uring_cmd_set_user_data(ioucmd, 1);
 
         spin_lock_irqsave(&dev->request_queue_lock, flags);
         list_add_tail(&req->list, &dev->request_queue);
@@ -452,8 +475,14 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
     case MOVIDIUS_URING_CMD_SUBMIT_BATCH: {
         struct batch_inference_request batch_req;
         struct inference_request __user *user_reqs;
-        struct batch_completion *batch;
         int i, j;
+        struct movidius_cmd_hdr hdr;
+
+        if (copy_from_user(&hdr, (void __user *)(uintptr_t)ioucmd->cmd.addr, sizeof(hdr)))
+            return -EFAULT;
+
+        if (hdr.version != MOVIDIUS_UAPI_VERSION)
+            return -EINVAL;
 
         if (copy_from_user(&batch_req, (void __user *)(uintptr_t)ioucmd->cmd.addr, sizeof(batch_req)))
             return -EFAULT;
@@ -461,51 +490,40 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
         if (batch_req.count > URB_POOL_SIZE)
             return -EINVAL;
 
-        batch = kzalloc(sizeof(*batch), GFP_KERNEL);
-        if (!batch)
-            return -ENOMEM;
-        init_completion(&batch->completion);
-        atomic_set(&batch->pending_reqs, batch_req.count);
+        io_uring_cmd_set_user_data(ioucmd, batch_req.count);
 
         user_reqs = (struct inference_request __user *)(uintptr_t)batch_req.reqs;
 
         for (i = 0; i < batch_req.count; i++) {
             req = kzalloc(sizeof(*req), GFP_KERNEL);
-            if (!req) {
-                kfree(batch);
+            if (!req)
                 return -ENOMEM;
-            }
 
             if (copy_from_user(req, &user_reqs[i], sizeof(struct inference_request))) {
                 kfree(req);
-                kfree(batch);
                 return -EFAULT;
             }
 
             if (req->num_input_segs > MAX_SG_SEGMENTS || req->num_output_segs > MAX_SG_SEGMENTS) {
                 kfree(req);
-                kfree(batch);
                 return -EINVAL;
             }
 
             for (j = 0; j < req->num_input_segs; j++) {
-                if (req->input_segs[j].offset + req->input_segs[j].len > DMA_BUFFER_SIZE) {
+                if (req->input_segs[j].offset + req->input_segs[j].len > dma_buf_size) {
                     kfree(req);
-                    kfree(batch);
                     return -EINVAL;
                 }
             }
 
             for (j = 0; j < req->num_output_segs; j++) {
-                if (req->output_segs[j].offset + req->output_segs[j].len > DMA_BUFFER_SIZE) {
+                if (req->output_segs[j].offset + req->output_segs[j].len > dma_buf_size) {
                     kfree(req);
-                    kfree(batch);
                     return -EINVAL;
                 }
             }
-            req->batch = batch;
             req->ioucmd = ioucmd;
-            io_uring_cmd_set_user_data(ioucmd, req->user_data);
+            atomic_inc(&dev->pending_reqs);
 
             spin_lock_irqsave(&dev->request_queue_lock, flags);
             list_add_tail(&req->list, &dev->request_queue);
@@ -544,11 +562,13 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
     spin_lock_init(&dev->request_queue_lock);
     init_waitqueue_head(&dev->request_queue_wait);
     atomic_set(&dev->pending_reqs, 0);
+    atomic_set(&dev->completed_reqs, 0);
+    atomic_set(&dev->reset_count, 0);
 
     dev->udev = usb_get_dev(interface_to_usbdev(interface));
     usb_set_intfdata(interface, dev);
 
-    dev->dma_buffer = usb_alloc_coherent(dev->udev, DMA_BUFFER_SIZE, GFP_KERNEL, &dev->dma_handle);
+    dev->dma_buffer = usb_alloc_coherent(dev->udev, dma_buf_size, GFP_KERNEL, &dev->dma_handle);
     if (!dev->dma_buffer) {
         printk(KERN_ERR "Failed to allocate DMA buffer\n");
         goto error;
@@ -562,6 +582,15 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
     if (start_submission_thread(dev)) {
         printk(KERN_ERR "start_submission_thread failed\n");
         goto error_urb_pool;
+    }
+
+    const struct firmware *fw;
+    if (request_firmware(&fw, fw_name, &interface->dev) == 0) {
+        printk(KERN_INFO "Firmware loaded, size %zu\n", fw->size);
+        /* Here we would send the firmware to the device */
+        release_firmware(fw);
+    } else {
+        dev_warn(&interface->dev, "no firmware found, continuing bare\n");
     }
 
     if (submission_cpu != -1 && submission_cpu < num_possible_cpus()) {
@@ -609,15 +638,43 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
         goto error_submission_thread;
     }
 
-    struct device *device = device_create(movidius_class, NULL, dev_num, NULL, "movidius_x_vpu");
-    if (IS_ERR(device)) {
-        printk(KERN_ERR "device_create failed\n");
-        ret = PTR_ERR(device);
+    int minor = idr_alloc(&movidius_idr, dev, 0, 0, GFP_KERNEL);
+    if (minor < 0) {
+        ret = minor;
         goto error_cdev;
+    }
+
+    dev->dev = device_create(movidius_class, NULL, MKDEV(MAJOR(dev_num), minor), NULL, "movidius_x_vpu%d", minor);
+    if (IS_ERR(dev->dev)) {
+        printk(KERN_ERR "device_create failed\n");
+        ret = PTR_ERR(dev->dev);
+        idr_remove(&movidius_idr, minor);
+        goto error_cdev;
+    }
+
+    usb_enable_autosuspend(dev->udev);
+    interface->needs_remote_wakeup = 1;
+    pm_runtime_set_active(&interface->dev);
+    pm_runtime_enable(&interface->dev);
+
+    ret = kobject_init_and_add(&dev->kobj, &movidius_ktype, &dev->dev->kobj, "telemetry");
+    if (ret) {
+        printk(KERN_ERR "kobject_init_and_add failed\n");
+        goto error_device;
+    }
+
+    ret = sysfs_create_group(&dev->kobj, &attr_group);
+    if (ret) {
+        printk(KERN_ERR "sysfs_create_group failed\n");
+        goto error_kobject;
     }
 
     return 0;
 
+error_kobject:
+    kobject_put(&dev->kobj);
+error_device:
+    device_destroy(movidius_class, dev_num);
 error_cdev:
     cdev_del(&dev->cdev);
 error_submission_thread:
@@ -625,11 +682,62 @@ error_submission_thread:
 error_urb_pool:
     urb_pool_free(dev);
 error_dma_buffer:
-    usb_free_coherent(dev->udev, DMA_BUFFER_SIZE, dev->dma_buffer, dev->dma_handle);
+    usb_free_coherent(dev->udev, dma_buf_size, dev->dma_buffer, dev->dma_handle);
 error:
     kfree(dev);
     return ret;
 }
+
+static ssize_t pending_reqs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, kobj);
+    return sprintf(buf, "%d\n", atomic_read(&dev->pending_reqs));
+}
+
+static ssize_t completed_reqs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, kobj);
+    return sprintf(buf, "%d\n", atomic_read(&dev->completed_reqs));
+}
+
+static ssize_t reset_count_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, kobj);
+    return sprintf(buf, "%d\n", atomic_read(&dev->reset_count));
+}
+
+static ssize_t dma_buf_size_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%lu\n", dma_buf_size);
+}
+
+static struct kobj_attribute pending_reqs_attribute = __ATTR_RO(pending_reqs);
+static struct kobj_attribute completed_reqs_attribute = __ATTR_RO(completed_reqs);
+static struct kobj_attribute reset_count_attribute = __ATTR_RO(reset_count);
+static struct kobj_attribute dma_buf_size_attribute = __ATTR_RO(dma_buf_size);
+
+static struct attribute *attrs[] = {
+    &pending_reqs_attribute.attr,
+    &completed_reqs_attribute.attr,
+    &reset_count_attribute.attr,
+    &dma_buf_size_attribute.attr,
+    NULL,
+};
+
+static struct attribute_group attr_group = {
+    .attrs = attrs,
+};
+
+static void movidius_x_vpu_release_sysfs(struct kobject *kobj)
+{
+    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, kobj);
+    usb_put_dev(dev->udev);
+}
+
+static struct kobj_type movidius_ktype = {
+    .sysfs_ops = &kobj_sysfs_ops,
+    .release = movidius_x_vpu_release_sysfs,
+};
 
 static void movidius_x_vpu_disconnect(struct usb_interface *interface)
 {
@@ -637,13 +745,44 @@ static void movidius_x_vpu_disconnect(struct usb_interface *interface)
 
     printk(KERN_INFO "Movidius Myriad X VPU device unplugged\n");
 
+    pm_runtime_disable(&interface->dev);
     stop_submission_thread(dev);
+    kobject_put(&dev->kobj);
     urb_pool_free(dev);
-    usb_free_coherent(dev->udev, DMA_BUFFER_SIZE, dev->dma_buffer, dev->dma_handle);
-    device_destroy(movidius_class, dev_num);
+    usb_free_coherent(dev->udev, dma_buf_size, dev->dma_buffer, dev->dma_handle);
+    device_destroy(movidius_class, dev->dev->devt);
+    idr_remove(&movidius_idr, MINOR(dev->dev->devt));
     cdev_del(&dev->cdev);
     usb_put_dev(dev->udev);
     kfree(dev);
+}
+
+static int movidius_x_vpu_post_reset(struct usb_interface *intf)
+{
+    struct movidius_x_vpu_dev *dev = usb_get_intfdata(intf);
+
+    printk(KERN_INFO "Movidius Myriad X VPU device reset\n");
+    atomic_inc(&dev->reset_count);
+
+    return 0;
+}
+
+static int movidius_x_vpu_runtime_suspend(struct usb_interface *intf, pm_message_t message)
+{
+    printk(KERN_INFO "Movidius Myriad X VPU runtime suspend\n");
+    return 0;
+}
+
+static int movidius_x_vpu_runtime_resume(struct usb_interface *intf)
+{
+    printk(KERN_INFO "Movidius Myriad X VPU runtime resume\n");
+    return 0;
+}
+
+static int movidius_x_vpu_runtime_idle(struct usb_interface *intf)
+{
+    printk(KERN_INFO "Movidius Myriad X VPU runtime idle\n");
+    return 0;
 }
 
 static struct usb_driver movidius_x_vpu_driver = {
@@ -651,6 +790,11 @@ static struct usb_driver movidius_x_vpu_driver = {
     .id_table = movidius_x_vpu_table,
     .probe = movidius_x_vpu_probe,
     .disconnect = movidius_x_vpu_disconnect,
+    .post_reset = movidius_x_vpu_post_reset,
+    .supports_autosuspend = 1,
+    .runtime_suspend = movidius_x_vpu_runtime_suspend,
+    .runtime_resume = movidius_x_vpu_runtime_resume,
+    .runtime_idle = movidius_x_vpu_runtime_idle,
 };
 
 static int __init movidius_x_vpu_init(void)
@@ -658,7 +802,7 @@ static int __init movidius_x_vpu_init(void)
     int result;
     printk(KERN_INFO "Movidius Myriad X VPU driver loading...\n");
 
-    result = alloc_chrdev_region(&dev_num, 0, MAX_DEV, "movidius_x_vpu");
+    result = alloc_chrdev_region(&dev_num, 0, 0, "movidius_x_vpu");
     if (result < 0) {
         printk(KERN_ERR "alloc_chrdev_region failed\n");
         return result;
@@ -666,7 +810,7 @@ static int __init movidius_x_vpu_init(void)
 
     movidius_class = class_create("movidius_x_vpu");
     if (IS_ERR(movidius_class)) {
-        unregister_chrdev_region(dev_num, MAX_DEV);
+        unregister_chrdev_region(dev_num, 0);
         return PTR_ERR(movidius_class);
     }
 
@@ -674,7 +818,7 @@ static int __init movidius_x_vpu_init(void)
     if (result) {
         printk(KERN_ERR "usb_register failed. Error number %d\n", result);
         class_destroy(movidius_class);
-        unregister_chrdev_region(dev_num, MAX_DEV);
+        unregister_chrdev_region(dev_num, 0);
     }
 
     return result;
@@ -685,7 +829,7 @@ static void __exit movidius_x_vpu_exit(void)
     printk(KERN_INFO "Movidius Myriad X VPU driver unloading...\n");
     usb_deregister(&movidius_x_vpu_driver);
     class_destroy(movidius_class);
-    unregister_chrdev_region(dev_num, MAX_DEV);
+    unregister_chrdev_region(dev_num, 0);
 }
 
 module_init(movidius_x_vpu_init);
