@@ -2,13 +2,29 @@
 
 This repository contains a custom, high-performance Linux kernel driver for the Intel Movidius Myriad X VPU. The driver is designed to provide a low-latency, high-throughput interface for submitting inference requests to the VPU, making it suitable for demanding machine learning applications.
 
-## Features
+## Performance Features & Expected Gains
 
-*   **Zero-Copy Data Path:** The driver uses a `mmap`'d DMA buffer to share data between user-space and the kernel, eliminating the need for expensive memory copies.
-*   **Asynchronous I/O with `io_uring`:** The driver uses the modern `io_uring` interface for submitting inference requests, providing a high-performance, low-latency alternative to traditional `ioctl` and `eventfd` mechanisms.
-*   **Persistent URB Pool:** The driver pre-allocates and reuses a pool of USB Request Blocks (URBs) to minimize the overhead of USB communication.
-*   **Concurrent Request Processing:** The driver can process multiple in-flight inference requests concurrently, keeping the VPU's pipeline full and maximizing throughput.
-*   **Scatter-Gather (SG) DMA:** The driver supports scatter-gather DMA, allowing a single inference request to be composed of multiple, non-contiguous memory buffers.
+This driver implements several advanced features to maximize performance. The following are architectural estimates of the expected gains and have not been confirmed by benchmarking.
+
+*   **Zero-Copy Data Path (User-Managed DMA Arenas):**
+    *   **What:** User-space applications can allocate large memory arenas and register them with the driver. The driver pins this memory and uses it directly for hardware DMA, eliminating all memory copies between user and kernel space.
+    *   **Why:** Eliminates expensive `memcpy` operations on every inference input/output.
+    *   **Expected Gain:** CPU usage reduction 25–80% on I/O heavy workloads; per-inference latency reduction of ~1–5 ms.
+
+*   **Asynchronous URB Pooling:**
+    *   **What:** A persistent pool of USB Request Blocks (URBs) is pre-allocated and reused for all transfers.
+    *   **Why:** Avoids the overhead of allocating and freeing URBs for each request.
+    *   **Expected Gain:** Throughput increase of ~10–40% in steady state and reduced tail latency.
+
+*   **Batch Submission & Adaptive Batching:**
+    *   **What:** Multiple inference requests are intelligently grouped into a single, large USB transfer. Batching is triggered by either a configurable time delay (`batch_delay_ms`) or a request count high-water mark (`batch_high_watermark`).
+    *   **Why:** Improves USB bus utilization and adapts to varying workloads to balance throughput and latency.
+    *   **Expected Gain:** Effective throughput (inferences/sec) increase of 2x–5x.
+
+*   **Low-Latency `io_uring` Interface:**
+    *   **What:** The driver uses the modern `io_uring` interface for request submission and completion.
+    *   **Why:** Minimizes syscall overhead and context switches.
+    *   **Expected Gain:** Combined with zero-copy, can double effective QPS for small models.
 
 ## Building and Installing the Driver
 

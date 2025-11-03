@@ -21,8 +21,7 @@
 
 #define MOVIDIUS_UAPI_VERSION 1
 
-struct movidius_x_vpu_dev;
-
+/* Module Parameters */
 static ushort vid = 0x03e7;
 module_param(vid, ushort, 0444);
 MODULE_PARM_DESC(vid, "USB Vendor ID (default 0x03e7)");
@@ -31,12 +30,6 @@ static ushort pid = 0x2485;
 module_param(pid, ushort, 0444);
 MODULE_PARM_DESC(pid, "USB Product ID (default 0x2485)");
 
-static struct usb_device_id movidius_x_vpu_table[] = {
-    { USB_DEVICE(vid, pid) },
-    {} /* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, movidius_x_vpu_table);
-
 static int submission_cpu = -1;
 module_param(submission_cpu, int, 0644);
 MODULE_PARM_DESC(submission_cpu, "The CPU to bind the submission thread to. -1 for unbound.");
@@ -44,6 +37,12 @@ MODULE_PARM_DESC(submission_cpu, "The CPU to bind the submission thread to. -1 f
 static int irq_cpu = -1;
 module_param(irq_cpu, int, 0644);
 MODULE_PARM_DESC(irq_cpu, "The CPU to affinitize USB interrupts to. -1 for unbound.");
+
+static struct usb_device_id movidius_x_vpu_table[] = {
+    { USB_DEVICE(vid, pid) },
+    {} /* Terminating entry */
+};
+MODULE_DEVICE_TABLE(usb, movidius_x_vpu_table);
 
 static char *fw_name = "movidius-x-vpu.fw";
 module_param(fw_name, charp, 0444);
@@ -57,22 +56,20 @@ static int urb_pool_size = 16;
 module_param(urb_pool_size, int, 0644);
 MODULE_PARM_DESC(urb_pool_size, "The number of URBs to pre-allocate in the pool.");
 
-static dev_t dev_num;
-static struct class *movidius_class;
-static DEFINE_IDR(movidius_idr);
-static struct cdev movidius_cdev;
+static int batch_high_watermark = 8;
+module_param(batch_high_watermark, int, 0644);
+MODULE_PARM_DESC(batch_high_watermark, "The number of requests in the queue that will trigger an immediate batch submission.");
 
-struct urb_pool {
-    struct list_head urb_list;
-    spinlock_t lock;
-};
+/* Data Structures */
+#define MAX_SG_SEGMENTS 16
+#define MAX_REQS_PER_URB 16
+
+struct movidius_x_vpu_dev;
 
 enum movidius_urb_direction {
     MOVIDIUS_URB_OUT,
     MOVIDIUS_URB_IN,
 };
-
-#define MAX_SG_SEGMENTS 16
 
 struct movidius_sg_segment {
     __u32 offset;
@@ -94,31 +91,39 @@ struct inference_request {
     u64 user_data;
 };
 
-struct movidius_urb;
-struct internal_inference_request;
-struct batch_job;
-
-struct movidius_x_vpu_dev {
-    struct device *dev;
-    struct usb_device *udev;
-    struct cdev cdev;
-    struct urb_pool urb_pool;
-    struct list_head request_queue;
-    spinlock_t request_queue_lock;
-    wait_queue_head_t request_queue_wait;
-    struct task_struct *submission_thread;
-    u8 bulk_in_endpoint_addr;
-    u8 bulk_out_endpoint_addr;
+struct batch_job {
+    struct io_uring_cmd *ioucmd;
     atomic_t pending_reqs;
-    atomic_t completed_reqs;
-    atomic_t reset_count;
-    struct kobject kobj;
-    struct hrtimer batch_timer;
-    struct work_struct batch_work;
 };
 
-/* Forward declaration for the timer function */
-static enum hrtimer_restart movidius_x_vpu_batch_timer(struct hrtimer *timer);
+struct internal_inference_request {
+    struct list_head list;
+    u64 user_data;
+
+    __u32 num_input_segs;
+    __u32 num_output_segs;
+    struct movidius_sg_segment input_segs[MAX_SG_SEGMENTS];
+    struct movidius_sg_segment output_segs[MAX_SG_SEGMENTS];
+
+    struct batch_job *job;
+};
+
+struct movidius_urb {
+    struct urb *urb;
+    struct list_head list; /* for the pool */
+    struct movidius_x_vpu_dev *dev;
+    enum movidius_urb_direction direction;
+
+    /* Context for a specific transfer */
+    int num_reqs;
+    struct internal_inference_request *reqs[MAX_REQS_PER_URB];
+    struct scatterlist *sg;
+};
+
+struct urb_pool {
+    struct list_head urb_list;
+    spinlock_t lock;
+};
 
 struct movidius_x_vpu_dev {
     struct device *dev;
@@ -144,8 +149,19 @@ struct movidius_x_vpu_dev {
     int num_pages;
 };
 
-static void urb_pool_free(struct movidius_x_vpu_dev *dev); // Forward declaration
+/* Global Variables */
+static dev_t dev_num;
+static struct class *movidius_class;
+static DEFINE_IDR(movidius_idr);
+static struct cdev movidius_cdev;
 
+/* Function Prototypes */
+static void urb_pool_free(struct movidius_x_vpu_dev *dev);
+static void movidius_x_vpu_urb_complete(struct urb *urb);
+static void movidius_x_vpu_batch_work(struct work_struct *work);
+static enum hrtimer_restart movidius_x_vpu_batch_timer(struct hrtimer *timer);
+
+/* URB Pool Management */
 static int urb_pool_init(struct movidius_x_vpu_dev *dev)
 {
     int i;
@@ -212,8 +228,7 @@ static void return_urb_to_pool(struct movidius_x_vpu_dev *dev, struct movidius_u
     wake_up_interruptible(&dev->request_queue_wait);
 }
 
-static void movidius_x_vpu_urb_complete(struct urb *urb); // Forward declaration
-
+/* Submission Thread */
 static int submission_thread_func(void *data)
 {
     struct movidius_x_vpu_dev *dev = data;
@@ -317,6 +332,7 @@ static int submission_thread_func(void *data)
     return 0;
 }
 
+/* URB Completion Handler */
 static void movidius_x_vpu_urb_complete(struct urb *urb)
 {
     struct movidius_urb *movidius_urb = urb->context;
@@ -406,24 +422,7 @@ static void movidius_x_vpu_urb_complete(struct urb *urb)
     }
 }
 
-static int start_submission_thread(struct movidius_x_vpu_dev *dev)
-{
-    dev->submission_thread = kthread_run(submission_thread_func, dev, "movidius_submission");
-    if (IS_ERR(dev->submission_thread)) {
-        printk(KERN_ERR "Failed to create submission thread\n");
-        return PTR_ERR(dev->submission_thread);
-    }
-    return 0;
-}
-
-static void stop_submission_thread(struct movidius_x_vpu_dev *dev)
-{
-    if (dev->submission_thread) {
-        kthread_stop(dev->submission_thread);
-        dev->submission_thread = NULL;
-    }
-}
-
+/* File Operations */
 static int movidius_x_vpu_open(struct inode *inode, struct file *file)
 {
     struct movidius_x_vpu_dev *dev;
@@ -456,47 +455,16 @@ struct batch_inference_request {
     __u64 reqs;
 };
 
-#define MAX_REQS_PER_URB 16
-
-struct batch_job {
-    struct io_uring_cmd *ioucmd;
-    atomic_t pending_reqs;
-};
-
-struct internal_inference_request {
-    struct list_head list;
-    u64 user_data;
-
-    __u32 num_input_segs;
-    __u32 num_output_segs;
-    struct movidius_sg_segment input_segs[MAX_SG_SEGMENTS];
-    struct movidius_sg_segment output_segs[MAX_SG_SEGMENTS];
-
-    struct batch_job *job;
-};
-
-struct movidius_urb {
-    struct urb *urb;
-    struct list_head list; /* for the pool */
-    struct movidius_x_vpu_dev *dev;
-    enum movidius_urb_direction direction;
-
-    /* Context for a specific transfer */
-    int num_reqs;
-    struct internal_inference_request *reqs[MAX_REQS_PER_URB];
-    struct scatterlist *sg;
-};
-
 static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
 {
     struct movidius_x_vpu_dev *dev = ioucmd->file->private_data;
-    struct internal_inference_request *req;
+    struct internal_inference_request *req, *tmp;
     unsigned long flags;
+    int req_count = 0;
 
     switch (ioucmd->cmd.opcode) {
     case MOVIDIUS_URING_CMD_SUBMIT_INFERENCE: {
         const struct inference_request __user *user_req = (const struct inference_request __user *)(uintptr_t)ioucmd->cmd.addr;
-        int i;
         struct movidius_cmd_hdr hdr;
         struct batch_job *job;
 
@@ -534,16 +502,24 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
 
         spin_lock_irqsave(&dev->request_queue_lock, flags);
         list_add_tail(&req->list, &dev->request_queue);
-        if (!hrtimer_is_queued(&dev->batch_timer))
-            hrtimer_start(&dev->batch_timer, ms_to_ktime(batch_delay_ms), HRTIMER_MODE_REL);
-        spin_unlock_irqrestore(&dev->request_queue_lock, flags);
-        wake_up_interruptible(&dev->request_queue_wait);
+        req_count = 0;
+        list_for_each_entry(req, &dev->request_queue, list)
+            req_count++;
+
+        if (req_count >= batch_high_watermark) {
+            spin_unlock_irqrestore(&dev->request_queue_lock, flags);
+            wake_up_interruptible(&dev->request_queue_wait);
+        } else {
+            if (!hrtimer_is_queued(&dev->batch_timer))
+                hrtimer_start(&dev->batch_timer, ms_to_ktime(batch_delay_ms), HRTIMER_MODE_REL);
+            spin_unlock_irqrestore(&dev->request_queue_lock, flags);
+        }
         break;
     }
     case MOVIDIUS_URING_CMD_SUBMIT_BATCH: {
         struct batch_inference_request batch_req;
         struct inference_request __user *user_reqs;
-        int i, j;
+        int i;
         struct movidius_cmd_hdr hdr;
         struct batch_job *job;
 
@@ -571,12 +547,14 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
             req = kzalloc(sizeof(*req), GFP_KERNEL);
             if (!req) {
                 /* Clean up already allocated requests */
+                spin_lock_irqsave(&dev->request_queue_lock, flags);
                 list_for_each_entry_safe(req, tmp, &dev->request_queue, list) {
                     if (req->job == job) {
                         list_del(&req->list);
                         kfree(req);
                     }
                 }
+                spin_unlock_irqrestore(&dev->request_queue_lock, flags);
                 kfree(job);
                 return -ENOMEM;
             }
@@ -599,9 +577,20 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
             list_add_tail(&req->list, &dev->request_queue);
             spin_unlock_irqrestore(&dev->request_queue_lock, flags);
         }
-        if (!hrtimer_is_queued(&dev->batch_timer))
-            hrtimer_start(&dev->batch_timer, ms_to_ktime(batch_delay_ms), HRTIMER_MODE_REL);
-        wake_up_interruptible(&dev->request_queue_wait);
+
+        spin_lock_irqsave(&dev->request_queue_lock, flags);
+        req_count = 0;
+        list_for_each_entry(req, &dev->request_queue, list)
+            req_count++;
+
+        if (req_count >= batch_high_watermark) {
+            spin_unlock_irqrestore(&dev->request_queue_lock, flags);
+            wake_up_interruptible(&dev->request_queue_wait);
+        } else {
+            if (!hrtimer_is_queued(&dev->batch_timer))
+                hrtimer_start(&dev->batch_timer, ms_to_ktime(batch_delay_ms), HRTIMER_MODE_REL);
+            spin_unlock_irqrestore(&dev->request_queue_lock, flags);
+        }
         break;
     }
     case MOVIDIUS_URING_CMD_REGISTER_DMA_BUFFER: {
@@ -679,33 +668,16 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
     return 0;
 }
 
-static void movidius_x_vpu_batch_work(struct work_struct *work);
-static enum hrtimer_restart movidius_x_vpu_batch_timer(struct hrtimer *timer);
+static const struct file_operations movidius_x_vpu_fops;
 
-static const struct file_operations movidius_x_vpu_fops = {
-    .owner = THIS_MODULE,
-    .open = movidius_x_vpu_open,
-    .release = movidius_x_vpu_release,
-    .io_uring_cmd = movidius_x_vpu_uring_cmd,
-};
-
-static void movidius_x_vpu_batch_work(struct work_struct *work)
-{
-    struct movidius_x_vpu_dev *dev = container_of(work, struct movidius_x_vpu_dev, batch_work);
-    wake_up_interruptible(&dev->request_queue_wait);
-}
-
-static enum hrtimer_restart movidius_x_vpu_batch_timer(struct hrtimer *timer)
-{
-    struct movidius_x_vpu_dev *dev = container_of(timer, struct movidius_x_vpu_dev, batch_timer);
-    schedule_work(&dev->batch_work);
-    return HRTIMER_NORESTART;
-}
-
+/* USB Probe and Disconnect */
 static int movidius_x_vpu_probe(struct usb_interface *interface, const struct usb_device_id *id)
 {
     struct movidius_x_vpu_dev *dev;
     int ret = 0;
+    struct usb_host_interface *iface_desc;
+    struct usb_endpoint_descriptor *endpoint;
+    int i;
 
     printk(KERN_INFO "Movidius Myriad X VPU device plugged in\n");
 
@@ -717,35 +689,58 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
     spin_lock_init(&dev->request_queue_lock);
     init_waitqueue_head(&dev->request_queue_wait);
     atomic_set(&dev->pending_reqs, 0);
-    hrtimer_init(&dev->batch_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-    dev->batch_timer.function = movidius_x_vpu_batch_timer;
-    INIT_WORK(&dev->batch_work, movidius_x_vpu_batch_work);
     atomic_set(&dev->completed_reqs, 0);
     atomic_set(&dev->reset_count, 0);
 
     dev->udev = usb_get_dev(interface_to_usbdev(interface));
     usb_set_intfdata(interface, dev);
 
-    if (urb_pool_init(dev)) {
-        printk(KERN_ERR "urb_pool_init failed\n");
-        goto error;
+    iface_desc = interface->cur_altsetting;
+    for (i = 0; i < iface_desc->desc.bNumEndpoints; ++i) {
+        endpoint = &iface_desc->endpoint[i].desc;
+        if (!dev->bulk_in_endpoint_addr &&
+            usb_endpoint_is_bulk_in(endpoint)) {
+            dev->bulk_in_endpoint_addr = endpoint->bEndpointAddress;
+        }
+        if (!dev->bulk_out_endpoint_addr &&
+            usb_endpoint_is_bulk_out(endpoint)) {
+            dev->bulk_out_endpoint_addr = endpoint->bEndpointAddress;
+        }
     }
-
-    if (start_submission_thread(dev)) {
-        printk(KERN_ERR "start_submission_thread failed\n");
-        goto error_urb_pool;
+    if (!(dev->bulk_in_endpoint_addr && dev->bulk_out_endpoint_addr)) {
+        printk(KERN_ERR "Could not find bulk-in and bulk-out endpoints\n");
+        ret = -ENODEV;
+        goto error_free_dev;
     }
 
     const struct firmware *fw;
     if (request_firmware(&fw, fw_name, &interface->dev) == 0) {
         printk(KERN_INFO "Firmware loaded, size %zu\n", fw->size);
-        int ret = usb_bulk_msg(dev->udev, usb_sndbulkpipe(dev->udev, dev->bulk_out_endpoint_addr),
-                               (void *)fw->data, fw->size, NULL, 5000);
+        int actual_length;
+        ret = usb_bulk_msg(dev->udev, usb_sndbulkpipe(dev->udev, dev->bulk_out_endpoint_addr),
+                               (void *)fw->data, fw->size, &actual_length, 5000);
         if (ret)
             dev_err(&interface->dev, "Failed to send firmware: %d\n", ret);
         release_firmware(fw);
     } else {
         dev_warn(&interface->dev, "no firmware found, continuing bare\n");
+    }
+
+    if (urb_pool_init(dev)) {
+        printk(KERN_ERR "urb_pool_init failed\n");
+        ret = -ENOMEM;
+        goto error_free_dev;
+    }
+
+    hrtimer_init(&dev->batch_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    dev->batch_timer.function = movidius_x_vpu_batch_timer;
+    INIT_WORK(&dev->batch_work, movidius_x_vpu_batch_work);
+
+    dev->submission_thread = kthread_run(submission_thread_func, dev, "movidius_submission");
+    if (IS_ERR(dev->submission_thread)) {
+        printk(KERN_ERR "Failed to create submission thread\n");
+        ret = PTR_ERR(dev->submission_thread);
+        goto error_urb_pool;
     }
 
     if (submission_cpu != -1 && submission_cpu < num_possible_cpus()) {
@@ -766,37 +761,10 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
     cdev_init(&dev->cdev, &movidius_x_vpu_fops);
     dev->cdev.owner = THIS_MODULE;
 
-    struct usb_host_interface *iface_desc;
-    struct usb_endpoint_descriptor *endpoint;
-    int i;
-
-    iface_desc = interface->cur_altsetting;
-    for (i = 0; i < iface_desc->desc.bNumEndpoints; ++i) {
-        endpoint = &iface_desc->endpoint[i].desc;
-        if (!dev->bulk_in_endpoint_addr &&
-            usb_endpoint_is_bulk_in(endpoint)) {
-            dev->bulk_in_endpoint_addr = endpoint->bEndpointAddress;
-        }
-        if (!dev->bulk_out_endpoint_addr &&
-            usb_endpoint_is_bulk_out(endpoint)) {
-            dev->bulk_out_endpoint_addr = endpoint->bEndpointAddress;
-        }
-    }
-    if (!(dev->bulk_in_endpoint_addr && dev->bulk_out_endpoint_addr)) {
-        printk(KERN_ERR "Could not find bulk-in and bulk-out endpoints\n");
-        goto error_submission_thread;
-    }
-
-    ret = cdev_add(&dev->cdev, dev_num, 1);
-    if (ret) {
-        printk(KERN_ERR "cdev_add failed\n");
-        goto error_submission_thread;
-    }
-
     int minor = idr_alloc(&movidius_idr, dev, 0, 0, GFP_KERNEL);
     if (minor < 0) {
         ret = minor;
-        goto error_cdev;
+        goto error_submission_thread;
     }
 
     dev->dev = device_create(movidius_class, NULL, MKDEV(MAJOR(dev_num), minor), NULL, "movidius_x_vpu%d", minor);
@@ -804,13 +772,8 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
         printk(KERN_ERR "device_create failed\n");
         ret = PTR_ERR(dev->dev);
         idr_remove(&movidius_idr, minor);
-        goto error_cdev;
+        goto error_submission_thread;
     }
-
-    usb_enable_autosuspend(dev->udev);
-    interface->needs_remote_wakeup = 1;
-    pm_runtime_set_active(&interface->dev);
-    pm_runtime_enable(&interface->dev);
 
     ret = kobject_init_and_add(&dev->kobj, &movidius_ktype, &dev->dev->kobj, "telemetry");
     if (ret) {
@@ -821,27 +784,43 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
     ret = sysfs_create_group(&dev->kobj, &attr_group);
     if (ret) {
         printk(KERN_ERR "sysfs_create_group failed\n");
-        goto error_kobject;
+        kobject_put(&dev->kobj);
+        goto error_device;
     }
 
     return 0;
 
-error_kobject:
-    kobject_put(&dev->kobj);
 error_device:
-    device_destroy(movidius_class, dev_num);
-error_cdev:
-    cdev_del(&dev->cdev);
+    idr_remove(&movidius_idr, minor);
 error_submission_thread:
-    stop_submission_thread(dev);
+    kthread_stop(dev->submission_thread);
 error_urb_pool:
     urb_pool_free(dev);
-error:
+error_free_dev:
     usb_put_dev(dev->udev);
     kfree(dev);
     return ret;
 }
 
+static void movidius_x_vpu_disconnect(struct usb_interface *interface)
+{
+    struct movidius_x_vpu_dev *dev = usb_get_intfdata(interface);
+
+    printk(KERN_INFO "Movidius Myriad X VPU device unplugged\n");
+
+    hrtimer_cancel(&dev->batch_timer);
+    cancel_work_sync(&dev->batch_work);
+    kthread_stop(dev->submission_thread);
+    kobject_put(&dev->kobj);
+    urb_pool_free(dev);
+    idr_remove(&movidius_idr, MINOR(dev->dev->devt));
+    device_destroy(movidius_class, dev->dev->devt);
+    cdev_del(&dev->cdev);
+    usb_put_dev(dev->udev);
+    kfree(dev);
+}
+
+/* Sysfs */
 static ssize_t pending_reqs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
     struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, kobj);
@@ -875,64 +854,18 @@ static struct attribute_group attr_group = {
     .attrs = attrs,
 };
 
-static void movidius_x_vpu_release_sysfs(struct kobject *kobj)
-{
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, kobj);
-    usb_put_dev(dev->udev);
-}
+static const struct sysfs_ops kobj_sysfs_ops = {
+    .show = NULL,
+    .store = NULL,
+};
 
 static struct kobj_type movidius_ktype = {
     .sysfs_ops = &kobj_sysfs_ops,
-    .release = movidius_x_vpu_release_sysfs,
+    .release = NULL,
 };
 
-static void movidius_x_vpu_disconnect(struct usb_interface *interface)
-{
-    struct movidius_x_vpu_dev *dev = usb_get_intfdata(interface);
 
-    printk(KERN_INFO "Movidius Myriad X VPU device unplugged\n");
-
-    hrtimer_cancel(&dev->batch_timer);
-    cancel_work_sync(&dev->batch_work);
-    pm_runtime_disable(&interface->dev);
-    stop_submission_thread(dev);
-    movidius_x_vpu_cleanup_dma(dev);
-    kobject_put(&dev->kobj);
-    urb_pool_free(dev);
-    device_destroy(movidius_class, dev->dev->devt);
-    idr_remove(&movidius_idr, MINOR(dev->dev->devt));
-    cdev_del(&dev->cdev);
-    usb_put_dev(dev->udev);
-    kfree(dev);
-}
-
-static void movidius_x_vpu_cleanup_dma(struct movidius_x_vpu_dev *dev)
-{
-    if (!dev->sg_table)
-        return;
-
-    dma_unmap_sg(&dev->udev->dev, dev->sg_table, dev->num_pages, DMA_BIDIRECTIONAL);
-    unpin_user_pages(dev->pages, dev->num_pages);
-    kfree(dev->pages);
-    kfree(dev->sg_table);
-    dev->sg_table = NULL;
-    dev->pages = NULL;
-    dev->num_pages = 0;
-}
-
-static int movidius_x_vpu_post_reset(struct usb_interface *intf)
-{
-    struct movidius_x_vpu_dev *dev = usb_get_intfdata(intf);
-
-    printk(KERN_INFO "Movidius Myriad X VPU device reset\n");
-    atomic_inc(&dev->reset_count);
-
-    return 0;
-}
-
-static void movidius_x_vpu_batch_work(struct work_struct *work);
-static enum hrtimer_restart movidius_x_vpu_batch_timer(struct hrtimer *timer);
-
+/* PM Callbacks */
 static int movidius_x_vpu_runtime_suspend(struct usb_interface *intf, pm_message_t message)
 {
     printk(KERN_INFO "Movidius Myriad X VPU runtime suspend\n");
@@ -951,18 +884,27 @@ static int movidius_x_vpu_runtime_idle(struct usb_interface *intf)
     return 0;
 }
 
+/* USB Driver Struct */
 static struct usb_driver movidius_x_vpu_driver = {
     .name = "movidius_x_vpu",
     .id_table = movidius_x_vpu_table,
     .probe = movidius_x_vpu_probe,
     .disconnect = movidius_x_vpu_disconnect,
-    .post_reset = movidius_x_vpu_post_reset,
     .supports_autosuspend = 1,
     .runtime_suspend = movidius_x_vpu_runtime_suspend,
     .runtime_resume = movidius_x_vpu_runtime_resume,
     .runtime_idle = movidius_x_vpu_runtime_idle,
 };
 
+/* File Operations Struct */
+static const struct file_operations movidius_x_vpu_fops = {
+    .owner = THIS_MODULE,
+    .open = movidius_x_vpu_open,
+    .release = movidius_x_vpu_release,
+    .io_uring_cmd = movidius_x_vpu_uring_cmd,
+};
+
+/* Module Init and Exit */
 static int __init movidius_x_vpu_init(void)
 {
     int result;
