@@ -21,6 +21,8 @@
 
 #define MOVIDIUS_UAPI_VERSION 1
 
+struct movidius_x_vpu_dev;
+
 static ushort vid = 0x03e7;
 module_param(vid, ushort, 0444);
 MODULE_PARM_DESC(vid, "USB Vendor ID (default 0x03e7)");
@@ -51,12 +53,14 @@ static int batch_delay_ms = 1;
 module_param(batch_delay_ms, int, 0644);
 MODULE_PARM_DESC(batch_delay_ms, "The maximum time in ms to wait for a batch to fill up.");
 
+static int urb_pool_size = 16;
+module_param(urb_pool_size, int, 0644);
+MODULE_PARM_DESC(urb_pool_size, "The number of URBs to pre-allocate in the pool.");
+
 static dev_t dev_num;
 static struct class *movidius_class;
 static DEFINE_IDR(movidius_idr);
 static struct cdev movidius_cdev;
-
-#define URB_POOL_SIZE 16
 
 struct urb_pool {
     struct list_head urb_list;
@@ -89,6 +93,32 @@ struct inference_request {
     struct movidius_sg_segment output_segs[MAX_SG_SEGMENTS];
     u64 user_data;
 };
+
+struct movidius_urb;
+struct internal_inference_request;
+struct batch_job;
+
+struct movidius_x_vpu_dev {
+    struct device *dev;
+    struct usb_device *udev;
+    struct cdev cdev;
+    struct urb_pool urb_pool;
+    struct list_head request_queue;
+    spinlock_t request_queue_lock;
+    wait_queue_head_t request_queue_wait;
+    struct task_struct *submission_thread;
+    u8 bulk_in_endpoint_addr;
+    u8 bulk_out_endpoint_addr;
+    atomic_t pending_reqs;
+    atomic_t completed_reqs;
+    atomic_t reset_count;
+    struct kobject kobj;
+    struct hrtimer batch_timer;
+    struct work_struct batch_work;
+};
+
+/* Forward declaration for the timer function */
+static enum hrtimer_restart movidius_x_vpu_batch_timer(struct hrtimer *timer);
 
 struct movidius_x_vpu_dev {
     struct device *dev;
@@ -124,7 +154,7 @@ static int urb_pool_init(struct movidius_x_vpu_dev *dev)
     INIT_LIST_HEAD(&dev->urb_pool.urb_list);
     spin_lock_init(&dev->urb_pool.lock);
 
-    for (i = 0; i < URB_POOL_SIZE; i++) {
+    for (i = 0; i < urb_pool_size; i++) {
         movidius_urb = kzalloc(sizeof(*movidius_urb), GFP_KERNEL);
         if (!movidius_urb)
             goto error;
@@ -197,6 +227,10 @@ static int submission_thread_func(void *data)
 
         if (kthread_should_stop())
             break;
+
+        /* A batch is ready, either by size or by timeout. */
+        hrtimer_cancel(&dev->batch_timer);
+        cancel_work_sync(&dev->batch_work);
 
         while (1) {
             struct list_head req_list;
@@ -503,6 +537,7 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
         if (!hrtimer_is_queued(&dev->batch_timer))
             hrtimer_start(&dev->batch_timer, ms_to_ktime(batch_delay_ms), HRTIMER_MODE_REL);
         spin_unlock_irqrestore(&dev->request_queue_lock, flags);
+        wake_up_interruptible(&dev->request_queue_wait);
         break;
     }
     case MOVIDIUS_URING_CMD_SUBMIT_BATCH: {
@@ -521,7 +556,7 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
         if (copy_from_user(&batch_req, (void __user *)(uintptr_t)ioucmd->cmd.addr, sizeof(batch_req)))
             return -EFAULT;
 
-        if (batch_req.count > URB_POOL_SIZE)
+        if (batch_req.count > urb_pool_size)
             return -EINVAL;
 
         job = kzalloc(sizeof(*job), GFP_KERNEL);
@@ -535,6 +570,13 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
         for (i = 0; i < batch_req.count; i++) {
             req = kzalloc(sizeof(*req), GFP_KERNEL);
             if (!req) {
+                /* Clean up already allocated requests */
+                list_for_each_entry_safe(req, tmp, &dev->request_queue, list) {
+                    if (req->job == job) {
+                        list_del(&req->list);
+                        kfree(req);
+                    }
+                }
                 kfree(job);
                 return -ENOMEM;
             }
@@ -559,6 +601,7 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
         }
         if (!hrtimer_is_queued(&dev->batch_timer))
             hrtimer_start(&dev->batch_timer, ms_to_ktime(batch_delay_ms), HRTIMER_MODE_REL);
+        wake_up_interruptible(&dev->request_queue_wait);
         break;
     }
     case MOVIDIUS_URING_CMD_REGISTER_DMA_BUFFER: {
@@ -591,7 +634,7 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
 
         dev->sg_table = kcalloc(dev->num_pages, sizeof(struct scatterlist), GFP_KERNEL);
         if (!dev->sg_table) {
-            unpinn_longterm_user_pages(dev->pages, dev->num_pages);
+            unpin_user_pages(dev->pages, dev->num_pages);
             kfree(dev->pages);
             io_uring_cmd_done(ioucmd, -ENOMEM, 0);
             break;
@@ -636,12 +679,28 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
     return 0;
 }
 
+static void movidius_x_vpu_batch_work(struct work_struct *work);
+static enum hrtimer_restart movidius_x_vpu_batch_timer(struct hrtimer *timer);
+
 static const struct file_operations movidius_x_vpu_fops = {
     .owner = THIS_MODULE,
     .open = movidius_x_vpu_open,
     .release = movidius_x_vpu_release,
     .io_uring_cmd = movidius_x_vpu_uring_cmd,
 };
+
+static void movidius_x_vpu_batch_work(struct work_struct *work)
+{
+    struct movidius_x_vpu_dev *dev = container_of(work, struct movidius_x_vpu_dev, batch_work);
+    wake_up_interruptible(&dev->request_queue_wait);
+}
+
+static enum hrtimer_restart movidius_x_vpu_batch_timer(struct hrtimer *timer)
+{
+    struct movidius_x_vpu_dev *dev = container_of(timer, struct movidius_x_vpu_dev, batch_timer);
+    schedule_work(&dev->batch_work);
+    return HRTIMER_NORESTART;
+}
 
 static int movidius_x_vpu_probe(struct usb_interface *interface, const struct usb_device_id *id)
 {
@@ -871,23 +930,13 @@ static int movidius_x_vpu_post_reset(struct usb_interface *intf)
     return 0;
 }
 
+static void movidius_x_vpu_batch_work(struct work_struct *work);
+static enum hrtimer_restart movidius_x_vpu_batch_timer(struct hrtimer *timer);
+
 static int movidius_x_vpu_runtime_suspend(struct usb_interface *intf, pm_message_t message)
 {
     printk(KERN_INFO "Movidius Myriad X VPU runtime suspend\n");
     return 0;
-}
-
-static void movidius_x_vpu_batch_work(struct work_struct *work)
-{
-    struct movidius_x_vpu_dev *dev = container_of(work, struct movidius_x_vpu_dev, batch_work);
-    wake_up_interruptible(&dev->request_queue_wait);
-}
-
-static enum hrtimer_restart movidius_x_vpu_batch_timer(struct hrtimer *timer)
-{
-    struct movidius_x_vpu_dev *dev = container_of(timer, struct movidius_x_vpu_dev, batch_timer);
-    schedule_work(&dev->batch_work);
-    return HRTIMER_NORESTART;
 }
 
 static int movidius_x_vpu_runtime_resume(struct usb_interface *intf)

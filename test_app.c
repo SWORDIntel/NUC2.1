@@ -36,6 +36,13 @@ struct register_dma_buffer_request {
     uint64_t len;
 };
 
+struct batch_inference_request {
+    struct movidius_cmd_hdr hdr;
+    uint32_t count;
+    uint32_t pad;
+    uint64_t reqs;
+};
+
 enum {
     MOVIDIUS_URING_CMD_SUBMIT_INFERENCE,
     MOVIDIUS_URING_CMD_SUBMIT_BATCH,
@@ -114,21 +121,38 @@ int main(int argc, char *argv[]) {
     io_uring_cqe_seen(&ring, cqe);
     printf("DMA buffer registered.\n");
 
-    printf("Submitting inference...\n");
-    struct inference_request infer_req = {
-        .hdr = { .version = MOVIDIUS_UAPI_VERSION, .op = 0, .len = sizeof(infer_req) },
-        .num_input_segs = 1,
-        .num_output_segs = 1,
-        .input_segs = { { .offset = 0, .len = 1024 } },
-        .output_segs = { { .offset = 1024, .len = 1024 } },
-        .user_data = 0xdeadbeef,
+    printf("Submitting batch of inferences...\n");
+
+    const int batch_size = 4;
+    struct inference_request *infer_reqs = calloc(batch_size, sizeof(struct inference_request));
+    if (!infer_reqs) {
+        perror("calloc");
+        // Handle cleanup
+        return 1;
+    }
+
+    for (int i = 0; i < batch_size; i++) {
+        infer_reqs[i] = (struct inference_request) {
+            .hdr = { .version = MOVIDIUS_UAPI_VERSION, .op = 0, .len = sizeof(struct inference_request) },
+            .num_input_segs = 1,
+            .num_output_segs = 1,
+            .input_segs = { { .offset = i * 2048, .len = 1024 } },
+            .output_segs = { { .offset = i * 2048 + 1024, .len = 1024 } },
+            .user_data = 0xdeadbeef + i,
+        };
+        memset(dma_buffer + i * 2048, 0xAA + i, 1024);
+    }
+
+    struct batch_inference_request batch_req = {
+        .hdr = { .version = MOVIDIUS_UAPI_VERSION, .op = 0, .len = sizeof(batch_req) },
+        .count = batch_size,
+        .reqs = (uint64_t)(uintptr_t)infer_reqs,
     };
-    memset(dma_buffer, 0xAA, 1024);
 
     sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_uring_cmd(sqe, MOVIDIUS_URING_CMD_SUBMIT_INFERENCE, fd);
-    sqe->addr = (uint64_t)(uintptr_t)&infer_req;
-    sqe->len = sizeof(infer_req);
+    io_uring_prep_uring_cmd(sqe, MOVIDIUS_URING_CMD_SUBMIT_BATCH, fd);
+    sqe->addr = (uint64_t)(uintptr_t)&batch_req;
+    sqe->len = sizeof(batch_req);
     io_uring_sqe_set_data(sqe, (void *)2);
 
     ret = io_uring_submit(&ring);
@@ -164,6 +188,7 @@ int main(int argc, char *argv[]) {
     io_uring_cqe_seen(&ring, cqe);
     printf("DMA buffer unregistered.\n");
 
+    free(infer_reqs);
     munmap(dma_buffer, DMA_BUFFER_SIZE);
     io_uring_queue_exit(&ring);
     close(fd);
