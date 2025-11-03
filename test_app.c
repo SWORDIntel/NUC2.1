@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -6,8 +5,6 @@
 #include <sys/mman.h>
 #include <string.h>
 #include <stdint.h>
-#include <signal.h>
-#include <fcntl.h>
 #include <liburing.h>
 
 #define DMA_BUFFER_SIZE (4 * 1024 * 1024)
@@ -15,6 +12,7 @@
 
 enum {
     MOVIDIUS_URING_CMD_SUBMIT_INFERENCE,
+    MOVIDIUS_URING_CMD_SUBMIT_BATCH,
 };
 
 struct inference_request {
@@ -25,12 +23,18 @@ struct inference_request {
     uint64_t user_data;
 };
 
+struct batch_inference_request {
+    uint32_t count;
+    uint32_t pad;
+    uint64_t reqs;
+};
+
 int main()
 {
     int fd, i, ret;
     void *dma_buffer;
     struct io_uring ring;
-    struct iovec iov;
+    struct inference_request *reqs;
 
     printf("Opening /dev/movidius_x_vpu...\n");
     fd = open("/dev/movidius_x_vpu", O_RDWR);
@@ -50,41 +54,39 @@ int main()
 
     printf("DMA buffer mapped successfully.\n");
 
-    ret = io_uring_queue_init(NUM_REQUESTS, &ring, 0);
+    ret = io_uring_queue_init(1, &ring, 0);
     if (ret < 0) {
         fprintf(stderr, "io_uring_queue_init failed: %d\n", ret);
         return EXIT_FAILURE;
     }
 
-    for (i = 0; i < NUM_REQUESTS; i++) {
-        struct io_uring_sqe *sqe;
-        struct inference_request *req;
-
-        sqe = io_uring_get_sqe(&ring);
-        if (!sqe) {
-            fprintf(stderr, "io_uring_get_sqe failed\n");
-            break;
-        }
-
-        req = malloc(sizeof(*req));
-        if (!req) {
-            fprintf(stderr, "malloc failed\n");
-            break;
-        }
-
-        sprintf(dma_buffer + (i * 2048), "Hello from request %d", i);
-        req->input_offset = i * 2048;
-        req->input_size = strlen(dma_buffer + (i * 2048)) + 1;
-        req->output_offset = (i * 2048) + 1024;
-        req->output_size = 1024;
-        req->user_data = i + 1;
-
-        iov.iov_base = req;
-        iov.iov_len = sizeof(*req);
-        io_uring_prep_rw(IORING_OP_URING_CMD, sqe, fd, &iov, 1, 0);
-        sqe->uring_cmd_opcode = MOVIDIUS_URING_CMD_SUBMIT_INFERENCE;
-        io_uring_sqe_set_data(sqe, (void *)(uintptr_t)req->user_data);
+    reqs = malloc(sizeof(*reqs) * NUM_REQUESTS);
+    if (!reqs) {
+        fprintf(stderr, "malloc failed\n");
+        return EXIT_FAILURE;
     }
+
+    for (i = 0; i < NUM_REQUESTS; i++) {
+        sprintf(dma_buffer + (i * 2048), "Hello from request %d", i);
+        reqs[i].input_offset = i * 2048;
+        reqs[i].input_size = strlen(dma_buffer + (i * 2048)) + 1;
+        reqs[i].output_offset = (i * 2048) + 1024;
+        reqs[i].output_size = 1024;
+        reqs[i].user_data = i + 1;
+    }
+
+    struct batch_inference_request batch_req = {
+        .count = NUM_REQUESTS,
+        .reqs = (uint64_t)(uintptr_t)reqs,
+    };
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        fprintf(stderr, "io_uring_get_sqe failed\n");
+        return EXIT_FAILURE;
+    }
+
+    io_uring_prep_uring_cmd(sqe, fd, MOVIDIUS_URING_CMD_SUBMIT_BATCH, &batch_req, 0);
 
     ret = io_uring_submit(&ring);
     if (ret < 0) {
@@ -104,6 +106,8 @@ int main()
                (unsigned long)cqe->user_data, cqe->res);
         io_uring_cqe_seen(&ring, cqe);
     }
+
+    free(reqs);
 
     if (munmap(dma_buffer, DMA_BUFFER_SIZE) == -1) {
         perror("munmap failed");
