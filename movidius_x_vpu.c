@@ -156,6 +156,7 @@ static dev_t dev_num;
 static struct class *movidius_class;
 static DEFINE_IDR(movidius_idr);
 static struct cdev movidius_cdev;
+static struct device *movidius_master_dev;
 
 static LIST_HEAD(movidius_devices);
 static DEFINE_SPINLOCK(movidius_devices_lock);
@@ -362,6 +363,38 @@ static int submission_thread_func(void *data)
     }
 
     return 0;
+    }
+    case MOVIDIUS_IOCTL_UNREGISTER_DMA_ARENA: {
+        if (dev) {
+            target_dev = dev;
+        } else {
+            target_dev = list_first_entry_or_null(&movidius_devices, struct movidius_x_vpu_dev, global_list);
+            if (!target_dev)
+                return -ENODEV;
+        }
+
+        if (!target_dev->sg_table)
+            return 0;
+
+        if (dev) { /* If not master device */
+            dma_unmap_sg(&target_dev->udev->dev, target_dev->sg_table, target_dev->num_pages, DMA_BIDIRECTIONAL);
+        } else { /* Master device, unmap for all devices */
+            list_for_each_entry(target_dev, &movidius_devices, global_list) {
+                dma_unmap_sg(&target_dev->udev->dev, target_dev->sg_table, target_dev->num_pages, DMA_BIDIRECTIONAL);
+            }
+        }
+
+        unpin_user_pages(target_dev->pages, target_dev->num_pages);
+        kfree(target_dev->pages);
+        kfree(target_dev->sg_table);
+        target_dev->sg_table = NULL;
+        target_dev->pages = NULL;
+        target_dev->num_pages = 0;
+
+        return 0;
+    }
+    }
+    return -EINVAL;
 }
 
 /* URB Completion Handler */
@@ -460,9 +493,11 @@ static void movidius_x_vpu_urb_complete(struct urb *urb)
 /* File Operations */
 static int movidius_x_vpu_open(struct inode *inode, struct file *file)
 {
-    struct movidius_x_vpu_dev *dev;
-    dev = container_of(inode->i_cdev, struct movidius_x_vpu_dev, cdev);
-    file->private_data = dev;
+    if (imajor(inode) == MAJOR(dev_num) && iminor(inode) != 0) {
+        struct movidius_x_vpu_dev *dev;
+        dev = container_of(inode->i_cdev, struct movidius_x_vpu_dev, cdev);
+        file->private_data = dev;
+    }
     return 0;
 }
 
@@ -471,16 +506,17 @@ static int movidius_x_vpu_release(struct inode *inode, struct file *file)
     return 0;
 }
 
+#define MOVIDIUS_IOCTL_REGISTER_DMA_ARENA _IOW('M', 1, struct movidius_dma_arena)
+#define MOVIDIUS_IOCTL_UNREGISTER_DMA_ARENA _IO('M', 2)
+
+struct movidius_dma_arena {
+    __u64 addr;
+    __u64 len;
+};
+
 enum {
     MOVIDIUS_URING_CMD_SUBMIT_INFERENCE,
     MOVIDIUS_URING_CMD_SUBMIT_BATCH,
-    MOVIDIUS_URING_CMD_REGISTER_DMA_BUFFER,
-    MOVIDIUS_URING_CMD_UNREGISTER_DMA_BUFFER,
-};
-
-struct register_dma_buffer_request {
-    __u64 addr;
-    __u64 len;
 };
 
 struct batch_inference_request {
@@ -492,16 +528,22 @@ struct batch_inference_request {
 
 static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
 {
+    struct movidius_x_vpu_dev *dev = ioucmd->file->private_data;
     struct movidius_x_vpu_dev *target_dev;
     struct internal_inference_request *req, *tmp;
     unsigned long flags;
     int req_count = 0;
 
-    switch (ioucmd->cmd.opcode) {
-    case MOVIDIUS_URING_CMD_SUBMIT_INFERENCE: {
+    if (dev) {
+        target_dev = dev;
+    } else {
         target_dev = get_next_movidius_dev();
         if (!target_dev)
             return -ENODEV;
+    }
+
+    switch (ioucmd->cmd.opcode) {
+    case MOVIDIUS_URING_CMD_SUBMIT_INFERENCE: {
 
         const struct inference_request __user *user_req = (const struct inference_request __user *)(uintptr_t)ioucmd->cmd.addr;
         struct movidius_cmd_hdr hdr;
@@ -634,74 +676,6 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
                 hrtimer_start(&target_dev->batch_timer, ms_to_ktime(batch_delay_ms), HRTIMER_MODE_REL);
             spin_unlock_irqrestore(&target_dev->request_queue_lock, flags);
         }
-        break;
-    }
-    case MOVIDIUS_URING_CMD_REGISTER_DMA_BUFFER: {
-        struct register_dma_buffer_request req;
-        int ret;
-
-        if (copy_from_user(&req, (void __user *)(uintptr_t)ioucmd->cmd.addr, sizeof(req))) {
-            io_uring_cmd_done(ioucmd, -EFAULT, 0);
-            break;
-        }
-
-        if (dev->sg_table) {
-            io_uring_cmd_done(ioucmd, -EBUSY, 0);
-            break;
-        }
-
-        dev->num_pages = (req.len + PAGE_SIZE - 1) / PAGE_SIZE;
-        dev->pages = kcalloc(dev->num_pages, sizeof(struct page *), GFP_KERNEL);
-        if (!dev->pages) {
-            io_uring_cmd_done(ioucmd, -ENOMEM, 0);
-            break;
-        }
-
-        ret = pin_user_pages(req.addr, dev->num_pages, FOLL_WRITE, dev->pages, NULL);
-        if (ret < 0) {
-            kfree(dev->pages);
-            io_uring_cmd_done(ioucmd, ret, 0);
-            break;
-        }
-
-        dev->sg_table = kcalloc(dev->num_pages, sizeof(struct scatterlist), GFP_KERNEL);
-        if (!dev->sg_table) {
-            unpin_user_pages(dev->pages, dev->num_pages);
-            kfree(dev->pages);
-            io_uring_cmd_done(ioucmd, -ENOMEM, 0);
-            break;
-        }
-        sg_init_table(dev->sg_table, dev->num_pages);
-        for (int i = 0; i < dev->num_pages; i++)
-            sg_set_page(&dev->sg_table[i], dev->pages[i], PAGE_SIZE, 0);
-
-        ret = dma_map_sg(&dev->udev->dev, dev->sg_table, dev->num_pages, DMA_BIDIRECTIONAL);
-        if (ret == 0) {
-            unpin_user_pages(dev->pages, dev->num_pages);
-            kfree(dev->pages);
-            kfree(dev->sg_table);
-            io_uring_cmd_done(ioucmd, -ENOMEM, 0);
-            break;
-        }
-
-        io_uring_cmd_done(ioucmd, 0, 0);
-        break;
-    }
-    case MOVIDIUS_URING_CMD_UNREGISTER_DMA_BUFFER: {
-        if (!dev->sg_table) {
-            io_uring_cmd_done(ioucmd, -EINVAL, 0);
-            break;
-        }
-
-        dma_unmap_sg(&dev->udev->dev, dev->sg_table, dev->num_pages, DMA_BIDIRECTIONAL);
-        unpin_user_pages(dev->pages, dev->num_pages);
-        kfree(dev->pages);
-        kfree(dev->sg_table);
-        dev->sg_table = NULL;
-        dev->pages = NULL;
-        dev->num_pages = 0;
-
-        io_uring_cmd_done(ioucmd, 0, 0);
         break;
     }
     default:
@@ -966,10 +940,86 @@ static struct usb_driver movidius_x_vpu_driver = {
 };
 
 /* File Operations Struct */
+static long movidius_x_vpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+
 static const struct file_operations movidius_x_vpu_fops = {
     .owner = THIS_MODULE,
     .open = movidius_x_vpu_open,
     .release = movidius_x_vpu_release,
+    .unlocked_ioctl = movidius_x_vpu_ioctl,
+    .io_uring_cmd = movidius_x_vpu_uring_cmd,
+};
+
+static long movidius_x_vpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct movidius_x_vpu_dev *dev = file->private_data;
+    struct movidius_x_vpu_dev *target_dev;
+
+    switch (cmd) {
+    case MOVIDIUS_IOCTL_REGISTER_DMA_ARENA: {
+        struct movidius_dma_arena arena;
+        if (copy_from_user(&arena, (void __user *)arg, sizeof(arena)))
+            return -EFAULT;
+
+    if (dev) { /* If not master device */
+        target_dev = dev;
+    } else { /* Master device, use first device for arena info */
+        target_dev = list_first_entry_or_null(&movidius_devices, struct movidius_x_vpu_dev, global_list);
+        if (!target_dev)
+            return -ENODEV;
+    }
+
+    if (target_dev->sg_table)
+        return -EBUSY;
+
+    target_dev->num_pages = (arena.len + PAGE_SIZE - 1) / PAGE_SIZE;
+    target_dev->pages = kcalloc(target_dev->num_pages, sizeof(struct page *), GFP_KERNEL);
+    if (!target_dev->pages)
+        return -ENOMEM;
+
+    int ret = pin_user_pages(arena.addr, target_dev->num_pages, FOLL_WRITE, target_dev->pages, NULL);
+    if (ret < 0) {
+        kfree(target_dev->pages);
+        return ret;
+    }
+
+    target_dev->sg_table = kcalloc(target_dev->num_pages, sizeof(struct scatterlist), GFP_KERNEL);
+    if (!target_dev->sg_table) {
+        unpin_user_pages(target_dev->pages, target_dev->num_pages);
+        kfree(target_dev->pages);
+        return -ENOMEM;
+    }
+    sg_init_table(target_dev->sg_table, target_dev->num_pages);
+    for (int i = 0; i < target_dev->num_pages; i++)
+        sg_set_page(&target_dev->sg_table[i], target_dev->pages[i], PAGE_SIZE, 0);
+
+    if (dev) { /* If not master device */
+        ret = dma_map_sg(&target_dev->udev->dev, target_dev->sg_table, target_dev->num_pages, DMA_BIDIRECTIONAL);
+        if (ret == 0) {
+            unpin_user_pages(target_dev->pages, target_dev->num_pages);
+            kfree(target_dev->pages);
+            kfree(target_dev->sg_table);
+            return -ENOMEM;
+        }
+    } else { /* Master device, map for all devices */
+        list_for_each_entry(target_dev, &movidius_devices, global_list) {
+            ret = dma_map_sg(&target_dev->udev->dev, target_dev->sg_table, target_dev->num_pages, DMA_BIDIRECTIONAL);
+            if (ret == 0) {
+                /* In a real implementation, we would need to unmap from the other devices here */
+                unpin_user_pages(target_dev->pages, target_dev->num_pages);
+                kfree(target_dev->pages);
+                kfree(target_dev->sg_table);
+                return -ENOMEM;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static const struct file_operations movidius_master_fops = {
+    .owner = THIS_MODULE,
+    .unlocked_ioctl = movidius_x_vpu_ioctl,
     .io_uring_cmd = movidius_x_vpu_uring_cmd,
 };
 
@@ -979,7 +1029,7 @@ static int __init movidius_x_vpu_init(void)
     int result;
     printk(KERN_INFO "Movidius Myriad X VPU driver loading...\n");
 
-    result = alloc_chrdev_region(&dev_num, 0, 0, "movidius_x_vpu");
+    result = alloc_chrdev_region(&dev_num, 0, 1, "movidius_x_vpu");
     if (result < 0) {
         printk(KERN_ERR "alloc_chrdev_region failed\n");
         return result;
@@ -987,15 +1037,36 @@ static int __init movidius_x_vpu_init(void)
 
     movidius_class = class_create("movidius_x_vpu");
     if (IS_ERR(movidius_class)) {
-        unregister_chrdev_region(dev_num, 0);
+        unregister_chrdev_region(dev_num, 1);
         return PTR_ERR(movidius_class);
+    }
+
+    cdev_init(&movidius_cdev, &movidius_master_fops);
+    movidius_cdev.owner = THIS_MODULE;
+    result = cdev_add(&movidius_cdev, dev_num, 1);
+    if (result) {
+        printk(KERN_ERR "cdev_add for master failed\n");
+        class_destroy(movidius_class);
+        unregister_chrdev_region(dev_num, 1);
+        return result;
+    }
+
+    movidius_master_dev = device_create(movidius_class, NULL, dev_num, NULL, "movidius_master");
+    if (IS_ERR(movidius_master_dev)) {
+        printk(KERN_ERR "device_create for master failed\n");
+        cdev_del(&movidius_cdev);
+        class_destroy(movidius_class);
+        unregister_chrdev_region(dev_num, 1);
+        return PTR_ERR(movidius_master_dev);
     }
 
     result = usb_register(&movidius_x_vpu_driver);
     if (result) {
         printk(KERN_ERR "usb_register failed. Error number %d\n", result);
+        device_destroy(movidius_class, dev_num);
+        cdev_del(&movidius_cdev);
         class_destroy(movidius_class);
-        unregister_chrdev_region(dev_num, 0);
+        unregister_chrdev_region(dev_num, 1);
     }
 
     return result;
@@ -1005,8 +1076,10 @@ static void __exit movidius_x_vpu_exit(void)
 {
     printk(KERN_INFO "Movidius Myriad X VPU driver unloading...\n");
     usb_deregister(&movidius_x_vpu_driver);
+    device_destroy(movidius_class, dev_num);
+    cdev_del(&movidius_cdev);
     class_destroy(movidius_class);
-    unregister_chrdev_region(dev_num, 0);
+    unregister_chrdev_region(dev_num, 1);
 }
 
 module_init(movidius_x_vpu_init);

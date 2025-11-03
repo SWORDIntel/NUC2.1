@@ -31,7 +31,10 @@ struct inference_request {
     uint64_t user_data;
 };
 
-struct register_dma_buffer_request {
+#define MOVIDIUS_IOCTL_REGISTER_DMA_ARENA _IOW('M', 1, struct movidius_dma_arena)
+#define MOVIDIUS_IOCTL_UNREGISTER_DMA_ARENA _IO('M', 2)
+
+struct movidius_dma_arena {
     uint64_t addr;
     uint64_t len;
 };
@@ -46,8 +49,6 @@ struct batch_inference_request {
 enum {
     MOVIDIUS_URING_CMD_SUBMIT_INFERENCE,
     MOVIDIUS_URING_CMD_SUBMIT_BATCH,
-    MOVIDIUS_URING_CMD_REGISTER_DMA_BUFFER,
-    MOVIDIUS_URING_CMD_UNREGISTER_DMA_BUFFER,
 };
 
 #define DMA_BUFFER_SIZE (16 * 1024 * 1024) // 16 MB
@@ -93,7 +94,7 @@ int main(int argc, char *argv[]) {
     ret = io_uring_queue_init(32, &ring, 0);
     if (ret < 0) {
         fprintf(stderr, "io_uring_queue_init failed: %d\n", ret);
-        close(fd);
+        for (int i = 0; i < num_devices; i++) close(fds[i]);
         return 1;
     }
 
@@ -101,41 +102,24 @@ int main(int argc, char *argv[]) {
     if (dma_buffer == MAP_FAILED) {
         perror("mmap");
         io_uring_queue_exit(&ring);
-        close(fd);
+        for (int i = 0; i < num_devices; i++) close(fds[i]);
         return 1;
     }
 
     printf("Registering DMA buffer...\n");
-    struct register_dma_buffer_request reg_req = {
+    struct movidius_dma_arena arena = {
         .addr = (uint64_t)dma_buffer,
         .len = DMA_BUFFER_SIZE,
     };
 
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_uring_cmd(sqe, MOVIDIUS_URING_CMD_REGISTER_DMA_BUFFER, fds[0]);
-    sqe->addr = (uint64_t)(uintptr_t)&reg_req;
-    sqe->len = sizeof(reg_req);
-    io_uring_sqe_set_data(sqe, (void *)1);
-
-    ret = io_uring_submit(&ring);
+    ret = ioctl(fds[0], MOVIDIUS_IOCTL_REGISTER_DMA_ARENA, &arena);
     if (ret < 0) {
-        fprintf(stderr, "io_uring_submit failed: %d\n", ret);
+        perror("ioctl");
+        munmap(dma_buffer, DMA_BUFFER_SIZE);
+        io_uring_queue_exit(&ring);
+        for (int i = 0; i < num_devices; i++) close(fds[i]);
         return 1;
     }
-
-    struct io_uring_cqe *cqe;
-    ret = io_uring_wait_cqe(&ring, &cqe);
-    if (ret < 0) {
-        fprintf(stderr, "io_uring_wait_cqe failed: %d\n", ret);
-        return 1;
-    }
-
-    if (cqe->res < 0) {
-        fprintf(stderr, "DMA buffer registration failed: %s\n", strerror(-cqe->res));
-        io_uring_cqe_seen(&ring, cqe);
-        return 1;
-    }
-    io_uring_cqe_seen(&ring, cqe);
     printf("DMA buffer registered.\n");
 
     printf("Submitting batches of inferences...\n");
@@ -144,12 +128,12 @@ int main(int argc, char *argv[]) {
     for (int j = 0; j < num_batches; j++) {
         const int batch_size = 4;
         struct inference_request *infer_reqs = calloc(batch_size, sizeof(struct inference_request));
-    if (!infer_reqs) {
-        perror("calloc");
-        return 1;
-    }
+        if (!infer_reqs) {
+            perror("calloc");
+            return 1;
+        }
 
-    for (int i = 0; i < batch_size; i++) {
+        for (int i = 0; i < batch_size; i++) {
         infer_reqs[i] = (struct inference_request){
             .hdr = {.version = MOVIDIUS_UAPI_VERSION, .op = 0, .len = sizeof(struct inference_request)},
             .num_input_segs = 1,
@@ -192,17 +176,10 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Unregistering DMA buffer...\n");
-    sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_uring_cmd(sqe, MOVIDIUS_URING_CMD_UNREGISTER_DMA_BUFFER, fds[0]);
-    sqe->addr = 0;
-    sqe->len = 0;
-    io_uring_sqe_set_data(sqe, (void *)3);
-    io_uring_submit(&ring);
-    io_uring_wait_cqe(&ring, &cqe);
-    if (cqe->res < 0) {
-        fprintf(stderr, "DMA buffer unregistration failed: %s\n", strerror(-cqe->res));
+    ret = ioctl(fds[0], MOVIDIUS_IOCTL_UNREGISTER_DMA_ARENA);
+    if (ret < 0) {
+        perror("ioctl");
     }
-    io_uring_cqe_seen(&ring, cqe);
     printf("DMA buffer unregistered.\n");
 
     munmap(dma_buffer, DMA_BUFFER_SIZE);

@@ -33,7 +33,29 @@ This driver implements several advanced features to maximize performance. The fo
 
 ## Multi-Device Operation & Scheduling
 
-The driver is designed to work with multiple Movidius VPUs in a single system. It includes a built-in round-robin scheduler that automatically distributes inference requests across all available devices. This means that you can submit requests to any device node (e.g., `/dev/movidius_x_vpu0`), and the driver will automatically select the next available device to process the request. This provides a simple and effective load balancing mechanism, and simplifies the user-space application, which does not need to be aware of the number of devices in the system.
+The driver is designed to work with multiple Movidius VPUs in a single system. It includes a built-in round-robin scheduler that automatically distributes inference requests across all available devices. A master device node, `/dev/movidius_master`, is created to act as a unified entry point for submitting inference requests. When a request is submitted to the master device, the driver will automatically select the next available device to process the request. This provides a simple and effective load balancing mechanism, and simplifies the user-space application, which does not need to be aware of the number of devices in the system.
+
+## Benchmarking
+
+A benchmark application, `benchmark.c`, is included to measure the performance of the driver.
+
+### Building the Benchmark
+
+To build the benchmark, run `make` with the `Makefile.benchmark` file:
+
+```bash
+make -f Makefile.benchmark
+```
+
+### Running the Benchmark
+
+To run the benchmark, simply execute the `benchmark` binary:
+
+```bash
+./benchmark
+```
+
+The benchmark will allocate and register a large DMA arena, launch multiple threads to submit batches of inference requests to the master device, and measure the total time and inferences per second.
 
 ## Recommended System Configuration
 
@@ -79,6 +101,7 @@ The driver exposes two module parameters that can be used for performance tuning
 *   `submission_cpu`: The CPU to bind the submission thread to. Pinning the submission thread to a specific CPU can improve cache locality and reduce context switching.
 *   `irq_cpu`: The CPU to affinitize USB interrupts to. Pinning USB interrupts to a specific CPU can reduce interrupt latency and improve throughput.
 *   `batch_delay_ms`: The maximum time in ms to wait for a batch to fill up. Increasing this value can improve throughput at the cost of increased latency.
+*   `batch_high_watermark`: The number of requests in the queue that will trigger an immediate batch submission.
 
 To use these parameters, specify them when loading the driver:
 
