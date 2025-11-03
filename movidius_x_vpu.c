@@ -29,10 +29,6 @@ static ushort pid = 0x2485;
 module_param(pid, ushort, 0444);
 MODULE_PARM_DESC(pid, "USB Product ID (default 0x2485)");
 
-static ulong dma_buf_size = 4UL * 1024 * 1024; /* 4 MiB default */
-module_param(dma_buf_size, ulong, 0644);
-MODULE_PARM_DESC(dma_buf_size, "DMA buffer size in bytes");
-
 static struct usb_device_id movidius_x_vpu_table[] = {
     { USB_DEVICE(vid, pid) },
     {} /* Terminating entry */
@@ -72,15 +68,6 @@ enum movidius_urb_direction {
     MOVIDIUS_URB_IN,
 };
 
-
-struct movidius_urb {
-    struct urb *urb;
-    struct list_head list;
-    struct movidius_x_vpu_dev *dev;
-    enum movidius_urb_direction direction;
-    struct internal_inference_request *req;
-};
-
 #define MAX_SG_SEGMENTS 16
 
 struct movidius_sg_segment {
@@ -112,8 +99,6 @@ struct movidius_x_vpu_dev {
     spinlock_t request_queue_lock;
     wait_queue_head_t request_queue_wait;
     struct task_struct *submission_thread;
-    void *dma_buffer;
-    dma_addr_t dma_handle;
     u8 bulk_in_endpoint_addr;
     u8 bulk_out_endpoint_addr;
     atomic_t pending_reqs;
@@ -122,6 +107,11 @@ struct movidius_x_vpu_dev {
     struct kobject kobj;
     struct hrtimer batch_timer;
     struct work_struct batch_work;
+
+    /* User-managed DMA arena */
+    struct scatterlist *sg_table;
+    struct page **pages;
+    int num_pages;
 };
 
 static void urb_pool_free(struct movidius_x_vpu_dev *dev); // Forward declaration
@@ -256,7 +246,8 @@ static int submission_thread_func(void *data)
             list_for_each_entry(req, &req_list, list) {
                 movidius_urb->reqs[current_req++] = req;
                 for (int i = 0; i < req->num_input_segs; i++, current_sg++) {
-                    sg_set_buf(&movidius_urb->sg[current_sg], dev->dma_buffer + req->input_segs[i].offset, req->input_segs[i].len);
+                    sg_set_page(&movidius_urb->sg[current_sg], dev->pages[req->input_segs[i].offset / PAGE_SIZE],
+                                req->input_segs[i].len, req->input_segs[i].offset % PAGE_SIZE);
                 }
             }
 
@@ -339,7 +330,8 @@ static void movidius_x_vpu_urb_complete(struct urb *urb)
         for (int i = 0; i < movidius_urb->num_reqs; i++) {
             struct internal_inference_request *req = movidius_urb->reqs[i];
             for (int j = 0; j < req->num_output_segs; j++, current_sg++) {
-                sg_set_buf(&movidius_urb->sg[current_sg], dev->dma_buffer + req->output_segs[j].offset, req->output_segs[j].len);
+                sg_set_page(&movidius_urb->sg[current_sg], dev->pages[req->output_segs[j].offset / PAGE_SIZE],
+                            req->output_segs[j].len, req->output_segs[j].offset % PAGE_SIZE);
             }
         }
 
@@ -411,31 +403,16 @@ static int movidius_x_vpu_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-static int movidius_x_vpu_mmap(struct file *file, struct vm_area_struct *vma)
-{
-    struct movidius_x_vpu_dev *dev = file->private_data;
-    unsigned long size = vma->vm_end - vma->vm_start;
-    unsigned long pfn;
-
-    if (size > dma_buf_size)
-        return -EINVAL;
-
-    pfn = virt_to_phys(dev->dma_buffer) >> PAGE_SHIFT;
-
-    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-    vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
-
-    if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot)) {
-        printk(KERN_ERR "remap_pfn_range failed\n");
-        return -EAGAIN;
-    }
-
-    return 0;
-}
-
 enum {
     MOVIDIUS_URING_CMD_SUBMIT_INFERENCE,
     MOVIDIUS_URING_CMD_SUBMIT_BATCH,
+    MOVIDIUS_URING_CMD_REGISTER_DMA_BUFFER,
+    MOVIDIUS_URING_CMD_UNREGISTER_DMA_BUFFER,
+};
+
+struct register_dma_buffer_request {
+    __u64 addr;
+    __u64 len;
 };
 
 struct batch_inference_request {
@@ -519,21 +496,6 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
             return -EINVAL;
         }
 
-        for (i = 0; i < req->num_input_segs; i++) {
-            if (req->input_segs[i].offset + req->input_segs[i].len > dma_buf_size) {
-                kfree(req);
-                kfree(job);
-                return -EINVAL;
-            }
-        }
-
-        for (i = 0; i < req->num_output_segs; i++) {
-            if (req->output_segs[i].offset + req->output_segs[i].len > dma_buf_size) {
-                kfree(req);
-                kfree(job);
-                return -EINVAL;
-            }
-        }
         req->job = job;
 
         spin_lock_irqsave(&dev->request_queue_lock, flags);
@@ -589,21 +551,6 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
                 return -EINVAL;
             }
 
-            for (j = 0; j < req->num_input_segs; j++) {
-                if (req->input_segs[j].offset + req->input_segs[j].len > dma_buf_size) {
-                    kfree(req);
-                    kfree(job);
-                    return -EINVAL;
-                }
-            }
-
-            for (j = 0; j < req->num_output_segs; j++) {
-                if (req->output_segs[j].offset + req->output_segs[j].len > dma_buf_size) {
-                    kfree(req);
-                    kfree(job);
-                    return -EINVAL;
-                }
-            }
             req->job = job;
 
             spin_lock_irqsave(&dev->request_queue_lock, flags);
@@ -612,6 +559,74 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
         }
         if (!hrtimer_is_queued(&dev->batch_timer))
             hrtimer_start(&dev->batch_timer, ms_to_ktime(batch_delay_ms), HRTIMER_MODE_REL);
+        break;
+    }
+    case MOVIDIUS_URING_CMD_REGISTER_DMA_BUFFER: {
+        struct register_dma_buffer_request req;
+        int ret;
+
+        if (copy_from_user(&req, (void __user *)(uintptr_t)ioucmd->cmd.addr, sizeof(req))) {
+            io_uring_cmd_done(ioucmd, -EFAULT, 0);
+            break;
+        }
+
+        if (dev->sg_table) {
+            io_uring_cmd_done(ioucmd, -EBUSY, 0);
+            break;
+        }
+
+        dev->num_pages = (req.len + PAGE_SIZE - 1) / PAGE_SIZE;
+        dev->pages = kcalloc(dev->num_pages, sizeof(struct page *), GFP_KERNEL);
+        if (!dev->pages) {
+            io_uring_cmd_done(ioucmd, -ENOMEM, 0);
+            break;
+        }
+
+        ret = pin_user_pages(req.addr, dev->num_pages, FOLL_WRITE, dev->pages, NULL);
+        if (ret < 0) {
+            kfree(dev->pages);
+            io_uring_cmd_done(ioucmd, ret, 0);
+            break;
+        }
+
+        dev->sg_table = kcalloc(dev->num_pages, sizeof(struct scatterlist), GFP_KERNEL);
+        if (!dev->sg_table) {
+            unpinn_longterm_user_pages(dev->pages, dev->num_pages);
+            kfree(dev->pages);
+            io_uring_cmd_done(ioucmd, -ENOMEM, 0);
+            break;
+        }
+        sg_init_table(dev->sg_table, dev->num_pages);
+        for (int i = 0; i < dev->num_pages; i++)
+            sg_set_page(&dev->sg_table[i], dev->pages[i], PAGE_SIZE, 0);
+
+        ret = dma_map_sg(&dev->udev->dev, dev->sg_table, dev->num_pages, DMA_BIDIRECTIONAL);
+        if (ret == 0) {
+            unpin_user_pages(dev->pages, dev->num_pages);
+            kfree(dev->pages);
+            kfree(dev->sg_table);
+            io_uring_cmd_done(ioucmd, -ENOMEM, 0);
+            break;
+        }
+
+        io_uring_cmd_done(ioucmd, 0, 0);
+        break;
+    }
+    case MOVIDIUS_URING_CMD_UNREGISTER_DMA_BUFFER: {
+        if (!dev->sg_table) {
+            io_uring_cmd_done(ioucmd, -EINVAL, 0);
+            break;
+        }
+
+        dma_unmap_sg(&dev->udev->dev, dev->sg_table, dev->num_pages, DMA_BIDIRECTIONAL);
+        unpin_user_pages(dev->pages, dev->num_pages);
+        kfree(dev->pages);
+        kfree(dev->sg_table);
+        dev->sg_table = NULL;
+        dev->pages = NULL;
+        dev->num_pages = 0;
+
+        io_uring_cmd_done(ioucmd, 0, 0);
         break;
     }
     default:
@@ -625,7 +640,6 @@ static const struct file_operations movidius_x_vpu_fops = {
     .owner = THIS_MODULE,
     .open = movidius_x_vpu_open,
     .release = movidius_x_vpu_release,
-    .mmap = movidius_x_vpu_mmap,
     .io_uring_cmd = movidius_x_vpu_uring_cmd,
 };
 
@@ -653,15 +667,9 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
     dev->udev = usb_get_dev(interface_to_usbdev(interface));
     usb_set_intfdata(interface, dev);
 
-    dev->dma_buffer = usb_alloc_coherent(dev->udev, dma_buf_size, GFP_KERNEL, &dev->dma_handle);
-    if (!dev->dma_buffer) {
-        printk(KERN_ERR "Failed to allocate DMA buffer\n");
-        goto error;
-    }
-
     if (urb_pool_init(dev)) {
         printk(KERN_ERR "urb_pool_init failed\n");
-        goto error_dma_buffer;
+        goto error;
     }
 
     if (start_submission_thread(dev)) {
@@ -769,9 +777,8 @@ error_submission_thread:
     stop_submission_thread(dev);
 error_urb_pool:
     urb_pool_free(dev);
-error_dma_buffer:
-    usb_free_coherent(dev->udev, dma_buf_size, dev->dma_buffer, dev->dma_handle);
 error:
+    usb_put_dev(dev->udev);
     kfree(dev);
     return ret;
 }
@@ -794,21 +801,14 @@ static ssize_t reset_count_show(struct kobject *kobj, struct kobj_attribute *att
     return sprintf(buf, "%d\n", atomic_read(&dev->reset_count));
 }
 
-static ssize_t dma_buf_size_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
-{
-    return sprintf(buf, "%lu\n", dma_buf_size);
-}
-
 static struct kobj_attribute pending_reqs_attribute = __ATTR_RO(pending_reqs);
 static struct kobj_attribute completed_reqs_attribute = __ATTR_RO(completed_reqs);
 static struct kobj_attribute reset_count_attribute = __ATTR_RO(reset_count);
-static struct kobj_attribute dma_buf_size_attribute = __ATTR_RO(dma_buf_size);
 
 static struct attribute *attrs[] = {
     &pending_reqs_attribute.attr,
     &completed_reqs_attribute.attr,
     &reset_count_attribute.attr,
-    &dma_buf_size_attribute.attr,
     NULL,
 };
 
@@ -837,14 +837,28 @@ static void movidius_x_vpu_disconnect(struct usb_interface *interface)
     cancel_work_sync(&dev->batch_work);
     pm_runtime_disable(&interface->dev);
     stop_submission_thread(dev);
+    movidius_x_vpu_cleanup_dma(dev);
     kobject_put(&dev->kobj);
     urb_pool_free(dev);
-    usb_free_coherent(dev->udev, dma_buf_size, dev->dma_buffer, dev->dma_handle);
     device_destroy(movidius_class, dev->dev->devt);
     idr_remove(&movidius_idr, MINOR(dev->dev->devt));
     cdev_del(&dev->cdev);
     usb_put_dev(dev->udev);
     kfree(dev);
+}
+
+static void movidius_x_vpu_cleanup_dma(struct movidius_x_vpu_dev *dev)
+{
+    if (!dev->sg_table)
+        return;
+
+    dma_unmap_sg(&dev->udev->dev, dev->sg_table, dev->num_pages, DMA_BIDIRECTIONAL);
+    unpin_user_pages(dev->pages, dev->num_pages);
+    kfree(dev->pages);
+    kfree(dev->sg_table);
+    dev->sg_table = NULL;
+    dev->pages = NULL;
+    dev->num_pages = 0;
 }
 
 static int movidius_x_vpu_post_reset(struct usb_interface *intf)
