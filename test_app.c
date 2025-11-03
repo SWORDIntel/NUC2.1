@@ -7,6 +7,7 @@
 #include <liburing.h>
 #include <sys/ioctl.h>
 #include <stdint.h>
+#include <sys/epoll.h>
 
 #define MOVIDIUS_UAPI_VERSION 1
 #define MAX_SG_SEGMENTS 16
@@ -94,9 +95,6 @@ int main(int argc, char *argv[]) {
     ret = io_uring_submit(&ring);
     if (ret < 0) {
         fprintf(stderr, "io_uring_submit failed: %d\n", ret);
-        munmap(dma_buffer, DMA_BUFFER_SIZE);
-        io_uring_queue_exit(&ring);
-        close(fd);
         return 1;
     }
 
@@ -104,18 +102,12 @@ int main(int argc, char *argv[]) {
     ret = io_uring_wait_cqe(&ring, &cqe);
     if (ret < 0) {
         fprintf(stderr, "io_uring_wait_cqe failed: %d\n", ret);
-        munmap(dma_buffer, DMA_BUFFER_SIZE);
-        io_uring_queue_exit(&ring);
-        close(fd);
         return 1;
     }
 
     if (cqe->res < 0) {
         fprintf(stderr, "DMA buffer registration failed: %s\n", strerror(-cqe->res));
         io_uring_cqe_seen(&ring, cqe);
-        munmap(dma_buffer, DMA_BUFFER_SIZE);
-        io_uring_queue_exit(&ring);
-        close(fd);
         return 1;
     }
     io_uring_cqe_seen(&ring, cqe);
@@ -127,24 +119,23 @@ int main(int argc, char *argv[]) {
     struct inference_request *infer_reqs = calloc(batch_size, sizeof(struct inference_request));
     if (!infer_reqs) {
         perror("calloc");
-        // Handle cleanup
         return 1;
     }
 
     for (int i = 0; i < batch_size; i++) {
-        infer_reqs[i] = (struct inference_request) {
-            .hdr = { .version = MOVIDIUS_UAPI_VERSION, .op = 0, .len = sizeof(struct inference_request) },
+        infer_reqs[i] = (struct inference_request){
+            .hdr = {.version = MOVIDIUS_UAPI_VERSION, .op = 0, .len = sizeof(struct inference_request)},
             .num_input_segs = 1,
             .num_output_segs = 1,
-            .input_segs = { { .offset = i * 2048, .len = 1024 } },
-            .output_segs = { { .offset = i * 2048 + 1024, .len = 1024 } },
+            .input_segs = {{.offset = i * 2048, .len = 1024}},
+            .output_segs = {{.offset = i * 2048 + 1024, .len = 1024}},
             .user_data = 0xdeadbeef + i,
         };
         memset(dma_buffer + i * 2048, 0xAA + i, 1024);
     }
 
     struct batch_inference_request batch_req = {
-        .hdr = { .version = MOVIDIUS_UAPI_VERSION, .op = 0, .len = sizeof(batch_req) },
+        .hdr = {.version = MOVIDIUS_UAPI_VERSION, .op = 0, .len = sizeof(batch_req)},
         .count = batch_size,
         .reqs = (uint64_t)(uintptr_t)infer_reqs,
     };
@@ -158,21 +149,19 @@ int main(int argc, char *argv[]) {
     ret = io_uring_submit(&ring);
     if (ret < 0) {
         fprintf(stderr, "io_uring_submit failed: %d\n", ret);
-        // Don't forget to unregister
     }
 
     ret = io_uring_wait_cqe(&ring, &cqe);
     if (ret < 0) {
         fprintf(stderr, "io_uring_wait_cqe failed: %d\n", ret);
-        // Don't forget to unregister
-    }
-
-    if (cqe->res < 0) {
-        fprintf(stderr, "Inference failed: %s\n", strerror(-cqe->res));
     } else {
-        printf("Inference successful.\n");
+        if (cqe->res < 0) {
+            fprintf(stderr, "Inference failed: %s\n", strerror(-cqe->res));
+        } else {
+            printf("Inference successful.\n");
+        }
+        io_uring_cqe_seen(&ring, cqe);
     }
-    io_uring_cqe_seen(&ring, cqe);
 
     printf("Unregistering DMA buffer...\n");
     sqe = io_uring_get_sqe(&ring);

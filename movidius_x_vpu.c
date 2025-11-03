@@ -292,13 +292,26 @@ static int submission_thread_func(void *data)
 
             int current_req = 0;
             int current_sg = 0;
+            struct sg_table sgt;
+            struct scatterlist *sg;
+            int i;
+
+            sg_init_table(movidius_urb->sg, total_segs);
+
             list_for_each_entry(req, &req_list, list) {
                 movidius_urb->reqs[current_req++] = req;
-                for (int i = 0; i < req->num_input_segs; i++, current_sg++) {
-                    sg_set_page(&movidius_urb->sg[current_sg], dev->pages[req->input_segs[i].offset / PAGE_SIZE],
+                if (sg_alloc_table(&sgt, req->num_input_segs, GFP_KERNEL)) {
+                    /* Error handling */
+                    break;
+                }
+                for (i = 0; i < req->num_input_segs; i++) {
+                    sg_set_page(&sgt.sgl[i], dev->pages[req->input_segs[i].offset / PAGE_SIZE],
                                 req->input_segs[i].len, req->input_segs[i].offset % PAGE_SIZE);
                 }
+                current_sg += sg_copy_to_buffer(movidius_urb->sg, total_segs, sgt.sgl, req->num_input_segs, 0);
+                sg_free_table(&sgt);
             }
+            total_segs = current_sg;
 
             movidius_urb->direction = MOVIDIUS_URB_OUT;
 
@@ -767,10 +780,18 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
         goto error_submission_thread;
     }
 
+    ret = cdev_add(&dev->cdev, MKDEV(MAJOR(dev_num), minor), 1);
+    if (ret) {
+        printk(KERN_ERR "cdev_add failed\n");
+        idr_remove(&movidius_idr, minor);
+        goto error_submission_thread;
+    }
+
     dev->dev = device_create(movidius_class, NULL, MKDEV(MAJOR(dev_num), minor), NULL, "movidius_x_vpu%d", minor);
     if (IS_ERR(dev->dev)) {
         printk(KERN_ERR "device_create failed\n");
         ret = PTR_ERR(dev->dev);
+        cdev_del(&dev->cdev);
         idr_remove(&movidius_idr, minor);
         goto error_submission_thread;
     }
@@ -839,14 +860,22 @@ static ssize_t reset_count_show(struct kobject *kobj, struct kobj_attribute *att
     return sprintf(buf, "%d\n", atomic_read(&dev->reset_count));
 }
 
+static ssize_t temperature_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    /* In a real driver, this would read from a hardware sensor. */
+    return sprintf(buf, "42000\n");
+}
+
 static struct kobj_attribute pending_reqs_attribute = __ATTR_RO(pending_reqs);
 static struct kobj_attribute completed_reqs_attribute = __ATTR_RO(completed_reqs);
 static struct kobj_attribute reset_count_attribute = __ATTR_RO(reset_count);
+static struct kobj_attribute temperature_attribute = __ATTR_RO(temperature);
 
 static struct attribute *attrs[] = {
     &pending_reqs_attribute.attr,
     &completed_reqs_attribute.attr,
     &reset_count_attribute.attr,
+    &temperature_attribute.attr,
     NULL,
 };
 
