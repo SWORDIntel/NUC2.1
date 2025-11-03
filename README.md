@@ -21,10 +21,28 @@ This driver implements several advanced features to maximize performance. The fo
     *   **Why:** Improves USB bus utilization and adapts to varying workloads to balance throughput and latency.
     *   **Expected Gain:** Effective throughput (inferences/sec) increase of 2x–5x.
 
+*   **Composite Device Optimizations:**
+    *   **What:** The driver includes a built-in round-robin scheduler that automatically distributes inference requests across all available Movidius VPUs in the system.
+    *   **Why:** This enables near-linear performance scaling with multiple devices and simplifies the user-space application, which no longer needs to manage multiple device handles.
+    *   **Expected Gain:** Near-linear scaling up to the limits of the USB hub/controller (typically 3-6 devices).
+
 *   **Low-Latency `io_uring` Interface:**
     *   **What:** The driver uses the modern `io_uring` interface for request submission and completion.
     *   **Why:** Minimizes syscall overhead and context switches.
     *   **Expected Gain:** Combined with zero-copy, can double effective QPS for small models.
+
+## Multi-Device Operation & Scheduling
+
+The driver is designed to work with multiple Movidius VPUs in a single system. It includes a built-in round-robin scheduler that automatically distributes inference requests across all available devices. This means that you can submit requests to any device node (e.g., `/dev/movidius_x_vpu0`), and the driver will automatically select the next available device to process the request. This provides a simple and effective load balancing mechanism, and simplifies the user-space application, which does not need to be aware of the number of devices in the system.
+
+## Recommended System Configuration
+
+For optimal performance, the following system configuration is recommended:
+
+*   **Multiple Movidius VPUs:** The driver is designed to scale with multiple devices. Using 2 or more VPUs will significantly improve throughput.
+*   **64GB or more of RAM:** A large amount of RAM allows for the creation of large, persistent DMA arenas, which can further improve performance by reducing memory management overhead.
+*   **A modern Linux kernel (5.10+):** A recent kernel is required for the best `io_uring` performance and features.
+*   **NUMA affinity:** For best performance, it is recommended to bind the submission thread and USB interrupts to different CPUs on the same NUMA node as the USB host controller.
 
 ## Building and Installing the Driver
 

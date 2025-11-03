@@ -147,6 +147,8 @@ struct movidius_x_vpu_dev {
     struct scatterlist *sg_table;
     struct page **pages;
     int num_pages;
+
+    struct list_head global_list;
 };
 
 /* Global Variables */
@@ -154,6 +156,31 @@ static dev_t dev_num;
 static struct class *movidius_class;
 static DEFINE_IDR(movidius_idr);
 static struct cdev movidius_cdev;
+
+static LIST_HEAD(movidius_devices);
+static DEFINE_SPINLOCK(movidius_devices_lock);
+static struct list_head *movidius_device_rr_cursor = &movidius_devices;
+
+static struct movidius_x_vpu_dev *get_next_movidius_dev(void)
+{
+    struct movidius_x_vpu_dev *dev;
+    unsigned long flags;
+
+    spin_lock_irqsave(&movidius_devices_lock, flags);
+    if (list_empty(&movidius_devices)) {
+        spin_unlock_irqrestore(&movidius_devices_lock, flags);
+        return NULL;
+    }
+
+    movidius_device_rr_cursor = movidius_device_rr_cursor->next;
+    if (movidius_device_rr_cursor == &movidius_devices)
+        movidius_device_rr_cursor = movidius_device_rr_cursor->next;
+
+    dev = list_entry(movidius_device_rr_cursor, struct movidius_x_vpu_dev, global_list);
+    spin_unlock_irqrestore(&movidius_devices_lock, flags);
+
+    return dev;
+}
 
 /* Function Prototypes */
 static void urb_pool_free(struct movidius_x_vpu_dev *dev);
@@ -292,24 +319,16 @@ static int submission_thread_func(void *data)
 
             int current_req = 0;
             int current_sg = 0;
-            struct sg_table sgt;
-            struct scatterlist *sg;
-            int i;
-
-            sg_init_table(movidius_urb->sg, total_segs);
 
             list_for_each_entry(req, &req_list, list) {
                 movidius_urb->reqs[current_req++] = req;
-                if (sg_alloc_table(&sgt, req->num_input_segs, GFP_KERNEL)) {
-                    /* Error handling */
-                    break;
+                for (int i = 0; i < req->num_input_segs; i++) {
+                    sg_set_page(&movidius_urb->sg[current_sg],
+                                dev->pages[(req->input_segs[i].offset) / PAGE_SIZE],
+                                req->input_segs[i].len,
+                                (req->input_segs[i].offset) % PAGE_SIZE);
+                    current_sg++;
                 }
-                for (i = 0; i < req->num_input_segs; i++) {
-                    sg_set_page(&sgt.sgl[i], dev->pages[req->input_segs[i].offset / PAGE_SIZE],
-                                req->input_segs[i].len, req->input_segs[i].offset % PAGE_SIZE);
-                }
-                current_sg += sg_copy_to_buffer(movidius_urb->sg, total_segs, sgt.sgl, req->num_input_segs, 0);
-                sg_free_table(&sgt);
             }
             total_segs = current_sg;
 
@@ -368,6 +387,9 @@ static void movidius_x_vpu_urb_complete(struct urb *urb)
     }
 
     if (movidius_urb->direction == MOVIDIUS_URB_OUT) {
+        printk(KERN_INFO "movidius_x_vpu%d: processing batch of %d requests\n",
+               iminor(dev->dev->inode), movidius_urb->num_reqs);
+
         int total_segs = 0;
         for (int i = 0; i < movidius_urb->num_reqs; i++)
             total_segs += movidius_urb->reqs[i]->num_output_segs;
@@ -470,13 +492,17 @@ struct batch_inference_request {
 
 static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
 {
-    struct movidius_x_vpu_dev *dev = ioucmd->file->private_data;
+    struct movidius_x_vpu_dev *target_dev;
     struct internal_inference_request *req, *tmp;
     unsigned long flags;
     int req_count = 0;
 
     switch (ioucmd->cmd.opcode) {
     case MOVIDIUS_URING_CMD_SUBMIT_INFERENCE: {
+        target_dev = get_next_movidius_dev();
+        if (!target_dev)
+            return -ENODEV;
+
         const struct inference_request __user *user_req = (const struct inference_request __user *)(uintptr_t)ioucmd->cmd.addr;
         struct movidius_cmd_hdr hdr;
         struct batch_job *job;
@@ -513,23 +539,27 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
 
         req->job = job;
 
-        spin_lock_irqsave(&dev->request_queue_lock, flags);
-        list_add_tail(&req->list, &dev->request_queue);
+        spin_lock_irqsave(&target_dev->request_queue_lock, flags);
+        list_add_tail(&req->list, &target_dev->request_queue);
         req_count = 0;
-        list_for_each_entry(req, &dev->request_queue, list)
+        list_for_each_entry(req, &target_dev->request_queue, list)
             req_count++;
 
         if (req_count >= batch_high_watermark) {
-            spin_unlock_irqrestore(&dev->request_queue_lock, flags);
-            wake_up_interruptible(&dev->request_queue_wait);
+            spin_unlock_irqrestore(&target_dev->request_queue_lock, flags);
+            wake_up_interruptible(&target_dev->request_queue_wait);
         } else {
-            if (!hrtimer_is_queued(&dev->batch_timer))
-                hrtimer_start(&dev->batch_timer, ms_to_ktime(batch_delay_ms), HRTIMER_MODE_REL);
-            spin_unlock_irqrestore(&dev->request_queue_lock, flags);
+            if (!hrtimer_is_queued(&target_dev->batch_timer))
+                hrtimer_start(&target_dev->batch_timer, ms_to_ktime(batch_delay_ms), HRTIMER_MODE_REL);
+            spin_unlock_irqrestore(&target_dev->request_queue_lock, flags);
         }
         break;
     }
     case MOVIDIUS_URING_CMD_SUBMIT_BATCH: {
+        target_dev = get_next_movidius_dev();
+        if (!target_dev)
+            return -ENODEV;
+
         struct batch_inference_request batch_req;
         struct inference_request __user *user_reqs;
         int i;
@@ -560,14 +590,14 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
             req = kzalloc(sizeof(*req), GFP_KERNEL);
             if (!req) {
                 /* Clean up already allocated requests */
-                spin_lock_irqsave(&dev->request_queue_lock, flags);
-                list_for_each_entry_safe(req, tmp, &dev->request_queue, list) {
+                spin_lock_irqsave(&target_dev->request_queue_lock, flags);
+                list_for_each_entry_safe(req, tmp, &target_dev->request_queue, list) {
                     if (req->job == job) {
                         list_del(&req->list);
                         kfree(req);
                     }
                 }
-                spin_unlock_irqrestore(&dev->request_queue_lock, flags);
+                spin_unlock_irqrestore(&target_dev->request_queue_lock, flags);
                 kfree(job);
                 return -ENOMEM;
             }
@@ -586,23 +616,23 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
 
             req->job = job;
 
-            spin_lock_irqsave(&dev->request_queue_lock, flags);
-            list_add_tail(&req->list, &dev->request_queue);
-            spin_unlock_irqrestore(&dev->request_queue_lock, flags);
+            spin_lock_irqsave(&target_dev->request_queue_lock, flags);
+            list_add_tail(&req->list, &target_dev->request_queue);
+            spin_unlock_irqrestore(&target_dev->request_queue_lock, flags);
         }
 
-        spin_lock_irqsave(&dev->request_queue_lock, flags);
+        spin_lock_irqsave(&target_dev->request_queue_lock, flags);
         req_count = 0;
-        list_for_each_entry(req, &dev->request_queue, list)
+        list_for_each_entry(req, &target_dev->request_queue, list)
             req_count++;
 
         if (req_count >= batch_high_watermark) {
-            spin_unlock_irqrestore(&dev->request_queue_lock, flags);
-            wake_up_interruptible(&dev->request_queue_wait);
+            spin_unlock_irqrestore(&target_dev->request_queue_lock, flags);
+            wake_up_interruptible(&target_dev->request_queue_wait);
         } else {
-            if (!hrtimer_is_queued(&dev->batch_timer))
-                hrtimer_start(&dev->batch_timer, ms_to_ktime(batch_delay_ms), HRTIMER_MODE_REL);
-            spin_unlock_irqrestore(&dev->request_queue_lock, flags);
+            if (!hrtimer_is_queued(&target_dev->batch_timer))
+                hrtimer_start(&target_dev->batch_timer, ms_to_ktime(batch_delay_ms), HRTIMER_MODE_REL);
+            spin_unlock_irqrestore(&target_dev->request_queue_lock, flags);
         }
         break;
     }
@@ -688,6 +718,7 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
 {
     struct movidius_x_vpu_dev *dev;
     int ret = 0;
+    unsigned long flags;
     struct usb_host_interface *iface_desc;
     struct usb_endpoint_descriptor *endpoint;
     int i;
@@ -809,6 +840,10 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
         goto error_device;
     }
 
+    spin_lock_irqsave(&movidius_devices_lock, flags);
+    list_add_tail(&dev->global_list, &movidius_devices);
+    spin_unlock_irqrestore(&movidius_devices_lock, flags);
+
     return 0;
 
 error_device:
@@ -826,8 +861,13 @@ error_free_dev:
 static void movidius_x_vpu_disconnect(struct usb_interface *interface)
 {
     struct movidius_x_vpu_dev *dev = usb_get_intfdata(interface);
+    unsigned long flags;
 
     printk(KERN_INFO "Movidius Myriad X VPU device unplugged\n");
+
+    spin_lock_irqsave(&movidius_devices_lock, flags);
+    list_del(&dev->global_list);
+    spin_unlock_irqrestore(&movidius_devices_lock, flags);
 
     hrtimer_cancel(&dev->batch_timer);
     cancel_work_sync(&dev->batch_work);
