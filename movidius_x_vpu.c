@@ -28,16 +28,28 @@ struct urb_pool {
     spinlock_t lock;
 };
 
+enum movidius_urb_direction {
+    MOVIDIUS_URB_OUT,
+    MOVIDIUS_URB_IN,
+};
+
 struct movidius_urb {
     struct urb *urb;
     struct list_head list;
     struct movidius_x_vpu_dev *dev;
+    enum movidius_urb_direction direction;
+    struct inference_request *req;
 };
 
 struct inference_request {
     struct list_head list;
-    // Add fields for input/output buffers, completion, etc.
+    size_t input_offset;
+    size_t input_size;
+    size_t output_offset;
+    size_t output_size;
 };
+
+#define DMA_BUFFER_SIZE (4 * 1024 * 1024) // 4MB
 
 struct movidius_x_vpu_dev {
     struct usb_device *udev;
@@ -47,7 +59,10 @@ struct movidius_x_vpu_dev {
     spinlock_t request_queue_lock;
     wait_queue_head_t request_queue_wait;
     struct task_struct *submission_thread;
-    // Add more fields for zero-copy implementation
+    void *dma_buffer;
+    dma_addr_t dma_handle;
+    u8 bulk_in_endpoint_addr;
+    u8 bulk_out_endpoint_addr;
 };
 
 static void urb_pool_free(struct movidius_x_vpu_dev *dev); // Forward declaration
@@ -117,6 +132,8 @@ static void return_urb_to_pool(struct movidius_x_vpu_dev *dev, struct movidius_u
     spin_unlock_irqrestore(&dev->urb_pool.lock, flags);
 }
 
+static void movidius_x_vpu_urb_complete(struct urb *urb); // Forward declaration
+
 static int submission_thread_func(void *data)
 {
     struct movidius_x_vpu_dev *dev = data;
@@ -140,11 +157,80 @@ static int submission_thread_func(void *data)
         spin_unlock_irq(&dev->request_queue_lock);
 
         // Process the request here
-        printk(KERN_INFO "Processing inference request\n");
-        kfree(req); // For now, just free it
+        printk(KERN_INFO "Processing inference request: input_offset=%zu, input_size=%zu, output_offset=%zu, output_size=%zu\n",
+               req->input_offset, req->input_size, req->output_offset, req->output_size);
+
+        struct movidius_urb *movidius_urb;
+        int ret;
+
+        movidius_urb = get_urb_from_pool(dev);
+        if (!movidius_urb) {
+            printk(KERN_ERR "Failed to get URB from pool, dropping request\n");
+            kfree(req);
+            continue;
+        }
+
+        movidius_urb->direction = MOVIDIUS_URB_OUT;
+        movidius_urb->req = req;
+
+        usb_fill_bulk_urb(movidius_urb->urb,
+                          dev->udev,
+                          usb_sndbulkpipe(dev->udev, dev->bulk_out_endpoint_addr),
+                          dev->dma_buffer + req->input_offset,
+                          req->input_size,
+                          movidius_x_vpu_urb_complete,
+                          movidius_urb);
+
+        movidius_urb->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+        movidius_urb->urb->transfer_dma = dev->dma_handle + req->input_offset;
+
+        ret = usb_submit_urb(movidius_urb->urb, GFP_KERNEL);
+        if (ret) {
+            printk(KERN_ERR "Failed to submit URB: %d\n", ret);
+            return_urb_to_pool(dev, movidius_urb);
+            kfree(req);
+        }
     }
 
     return 0;
+}
+
+static void movidius_x_vpu_urb_complete(struct urb *urb)
+{
+    struct movidius_urb *movidius_urb = urb->context;
+    struct movidius_x_vpu_dev *dev = movidius_urb->dev;
+    struct inference_request *req = movidius_urb->req;
+    int ret;
+
+    if (urb->status) {
+        printk(KERN_ERR "URB completed with status %d\n", urb->status);
+        kfree(req);
+        return_urb_to_pool(dev, movidius_urb);
+        return;
+    }
+
+    if (movidius_urb->direction == MOVIDIUS_URB_OUT) {
+        movidius_urb->direction = MOVIDIUS_URB_IN;
+        usb_fill_bulk_urb(movidius_urb->urb,
+                          dev->udev,
+                          usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpoint_addr),
+                          dev->dma_buffer + req->output_offset,
+                          req->output_size,
+                          movidius_x_vpu_urb_complete,
+                          movidius_urb);
+        movidius_urb->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+        movidius_urb->urb->transfer_dma = dev->dma_handle + req->output_offset;
+        ret = usb_submit_urb(movidius_urb->urb, GFP_KERNEL);
+        if (ret) {
+            printk(KERN_ERR "Failed to submit bulk in URB: %d\n", ret);
+            kfree(req);
+            return_urb_to_pool(dev, movidius_urb);
+        }
+    } else {
+        printk(KERN_INFO "Inference complete\n");
+        kfree(req);
+        return_urb_to_pool(dev, movidius_urb);
+    }
 }
 
 static int start_submission_thread(struct movidius_x_vpu_dev *dev)
@@ -180,9 +266,24 @@ static int movidius_x_vpu_release(struct inode *inode, struct file *file)
 
 static int movidius_x_vpu_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    // Zero-copy implementation will go here
-    printk(KERN_INFO "mmap called\n");
-    return -EINVAL; // Not implemented yet
+    struct movidius_x_vpu_dev *dev = file->private_data;
+    unsigned long size = vma->vm_end - vma->vm_start;
+    unsigned long pfn;
+
+    if (size > DMA_BUFFER_SIZE)
+        return -EINVAL;
+
+    pfn = virt_to_phys(dev->dma_buffer) >> PAGE_SHIFT;
+
+    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+    vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
+
+    if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot)) {
+        printk(KERN_ERR "remap_pfn_range failed\n");
+        return -EAGAIN;
+    }
+
+    return 0;
 }
 
 #define MOVIDIUS_IOCTL_SUBMIT_INFERENCE _IOW('m', 1, struct inference_request)
@@ -238,9 +339,15 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
     dev->udev = usb_get_dev(interface_to_usbdev(interface));
     usb_set_intfdata(interface, dev);
 
+    dev->dma_buffer = usb_alloc_coherent(dev->udev, DMA_BUFFER_SIZE, GFP_KERNEL, &dev->dma_handle);
+    if (!dev->dma_buffer) {
+        printk(KERN_ERR "Failed to allocate DMA buffer\n");
+        goto error;
+    }
+
     if (urb_pool_init(dev)) {
         printk(KERN_ERR "urb_pool_init failed\n");
-        goto error;
+        goto error_dma_buffer;
     }
 
     if (start_submission_thread(dev)) {
@@ -250,6 +357,27 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
 
     cdev_init(&dev->cdev, &movidius_x_vpu_fops);
     dev->cdev.owner = THIS_MODULE;
+
+    struct usb_host_interface *iface_desc;
+    struct usb_endpoint_descriptor *endpoint;
+    int i;
+
+    iface_desc = interface->cur_altsetting;
+    for (i = 0; i < iface_desc->desc.bNumEndpoints; ++i) {
+        endpoint = &iface_desc->endpoint[i].desc;
+        if (!dev->bulk_in_endpoint_addr &&
+            usb_endpoint_is_bulk_in(endpoint)) {
+            dev->bulk_in_endpoint_addr = endpoint->bEndpointAddress;
+        }
+        if (!dev->bulk_out_endpoint_addr &&
+            usb_endpoint_is_bulk_out(endpoint)) {
+            dev->bulk_out_endpoint_addr = endpoint->bEndpointAddress;
+        }
+    }
+    if (!(dev->bulk_in_endpoint_addr && dev->bulk_out_endpoint_addr)) {
+        printk(KERN_ERR "Could not find bulk-in and bulk-out endpoints\n");
+        goto error_submission_thread;
+    }
 
     ret = cdev_add(&dev->cdev, dev_num, 1);
     if (ret) {
@@ -265,6 +393,8 @@ error_submission_thread:
     stop_submission_thread(dev);
 error_urb_pool:
     urb_pool_free(dev);
+error_dma_buffer:
+    usb_free_coherent(dev->udev, DMA_BUFFER_SIZE, dev->dma_buffer, dev->dma_handle);
 error:
     kfree(dev);
     return ret;
@@ -288,6 +418,7 @@ static void movidius_x_vpu_disconnect(struct usb_interface *interface)
     stop_submission_thread(dev);
     free_request_queue(dev);
     urb_pool_free(dev);
+    usb_free_coherent(dev->udev, DMA_BUFFER_SIZE, dev->dma_buffer, dev->dma_handle);
     device_destroy(movidius_class, dev_num);
     cdev_del(&dev->cdev);
     usb_put_dev(dev->udev);
