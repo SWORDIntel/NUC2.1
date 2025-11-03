@@ -44,6 +44,7 @@ The driver exposes two module parameters that can be used for performance tuning
 
 *   `submission_cpu`: The CPU to bind the submission thread to. Pinning the submission thread to a specific CPU can improve cache locality and reduce context switching.
 *   `irq_cpu`: The CPU to affinitize USB interrupts to. Pinning USB interrupts to a specific CPU can reduce interrupt latency and improve throughput.
+*   `batch_delay_ms`: The maximum time in ms to wait for a batch to fill up. Increasing this value can improve throughput at the cost of increased latency.
 
 To use these parameters, specify them when loading the driver:
 
