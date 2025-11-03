@@ -8,6 +8,7 @@
 #include <linux/io_uring.h>
 #include <linux/moduleparam.h>
 #include <linux/interrupt.h>
+#include <linux/scatterlist.h>
 
 #define VENDOR_ID_INTEL 0x03e7
 #define PRODUCT_ID_MYRIAD_X 0x2485
@@ -53,11 +54,18 @@ struct movidius_urb {
     struct internal_inference_request *req;
 };
 
+#define MAX_SG_SEGMENTS 16
+
+struct movidius_sg_segment {
+    __u32 offset;
+    __u32 len;
+};
+
 struct inference_request {
-    size_t input_offset;
-    size_t input_size;
-    size_t output_offset;
-    size_t output_size;
+    __u32 num_input_segs;
+    __u32 num_output_segs;
+    struct movidius_sg_segment input_segs[MAX_SG_SEGMENTS];
+    struct movidius_sg_segment output_segs[MAX_SG_SEGMENTS];
     u64 user_data;
 };
 
@@ -180,8 +188,24 @@ static int submission_thread_func(void *data)
             list_del(&req->list);
             spin_unlock_irq(&dev->request_queue_lock);
 
-            printk(KERN_INFO "Processing inference request: input_offset=%zu, input_size=%zu, output_offset=%zu, output_size=%zu, user_data=%llu\n",
-                   req->input_offset, req->input_size, req->output_offset, req->output_size, req->user_data);
+            int i;
+
+            printk(KERN_INFO "Processing SG inference request: num_input_segs=%u, user_data=%llu\n",
+                   req->num_input_segs, req->user_data);
+
+            req->sg = kcalloc(req->num_input_segs, sizeof(struct scatterlist), GFP_KERNEL);
+            if (!req->sg) {
+                io_uring_cmd_done(req->ioucmd, -ENOMEM, 0);
+                kfree(req);
+                return_urb_to_pool(dev, movidius_urb);
+                continue;
+            }
+
+            sg_init_table(req->sg, req->num_input_segs);
+
+            for (i = 0; i < req->num_input_segs; i++) {
+                sg_set_buf(&req->sg[i], dev->dma_buffer + req->input_segs[i].offset, req->input_segs[i].len);
+            }
 
             movidius_urb->direction = MOVIDIUS_URB_OUT;
             movidius_urb->req = req;
@@ -189,13 +213,13 @@ static int submission_thread_func(void *data)
             usb_fill_bulk_urb(movidius_urb->urb,
                               dev->udev,
                               usb_sndbulkpipe(dev->udev, dev->bulk_out_endpoint_addr),
-                              dev->dma_buffer + req->input_offset,
-                              req->input_size,
+                              NULL, /* We are using SG, so this is NULL */
+                              0,    /* And this is 0 */
                               movidius_x_vpu_urb_complete,
                               movidius_urb);
 
-            movidius_urb->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-            movidius_urb->urb->transfer_dma = dev->dma_handle + req->input_offset;
+            movidius_urb->urb->num_sgs = req->num_input_segs;
+            movidius_urb->urb->sg = req->sg;
 
             ret = usb_submit_urb(movidius_urb->urb, GFP_KERNEL);
             if (ret) {
@@ -206,7 +230,6 @@ static int submission_thread_func(void *data)
                 /* Continue to the next request */
             }
         }
-        spin_unlock_irq(&dev->request_queue_lock);
     }
 
     return 0;
@@ -221,39 +244,66 @@ static void movidius_x_vpu_urb_complete(struct urb *urb)
 
     if (urb->status) {
         printk(KERN_ERR "URB completed with status %d\n", urb->status);
-        complete(&req->completion);
-        if (atomic_dec_and_test(&dev->pending_reqs))
+        kfree(req->sg);
+        if (atomic_dec_and_test(&req->batch->pending_reqs)) {
             io_uring_cmd_done(req->ioucmd, urb->status, 0);
+            kfree(req->batch);
+        }
         kfree(req);
         return_urb_to_pool(dev, movidius_urb);
         return;
     }
 
     if (movidius_urb->direction == MOVIDIUS_URB_OUT) {
+        int i;
+
+        kfree(req->sg);
+
+        req->sg = kcalloc(req->num_output_segs, sizeof(struct scatterlist), GFP_KERNEL);
+        if (!req->sg) {
+            if (atomic_dec_and_test(&req->batch->pending_reqs)) {
+                io_uring_cmd_done(req->ioucmd, -ENOMEM, 0);
+                kfree(req->batch);
+            }
+            kfree(req);
+            return_urb_to_pool(dev, movidius_urb);
+            return;
+        }
+
+        sg_init_table(req->sg, req->num_output_segs);
+
+        for (i = 0; i < req->num_output_segs; i++) {
+            sg_set_buf(&req->sg[i], dev->dma_buffer + req->output_segs[i].offset, req->output_segs[i].len);
+        }
+
         movidius_urb->direction = MOVIDIUS_URB_IN;
         usb_fill_bulk_urb(movidius_urb->urb,
                           dev->udev,
                           usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpoint_addr),
-                          dev->dma_buffer + req->output_offset,
-                          req->output_size,
+                          NULL,
+                          0,
                           movidius_x_vpu_urb_complete,
                           movidius_urb);
-        movidius_urb->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-        movidius_urb->urb->transfer_dma = dev->dma_handle + req->output_offset;
+        movidius_urb->urb->num_sgs = req->num_output_segs;
+        movidius_urb->urb->sg = req->sg;
         ret = usb_submit_urb(movidius_urb->urb, GFP_KERNEL);
         if (ret) {
             printk(KERN_ERR "Failed to submit bulk in URB: %d\n", ret);
-            complete(&req->completion);
-            if (atomic_dec_and_test(&dev->pending_reqs))
+            kfree(req->sg);
+            if (atomic_dec_and_test(&req->batch->pending_reqs)) {
                 io_uring_cmd_done(req->ioucmd, ret, 0);
+                kfree(req->batch);
+            }
             kfree(req);
             return_urb_to_pool(dev, movidius_urb);
         }
     } else {
         printk(KERN_INFO "Inference complete\n");
-        complete(&req->completion);
-        if (atomic_dec_and_test(&dev->pending_reqs))
+        kfree(req->sg);
+        if (atomic_dec_and_test(&req->batch->pending_reqs)) {
             io_uring_cmd_done(req->ioucmd, 0, 0);
+            kfree(req->batch);
+        }
         kfree(req);
         return_urb_to_pool(dev, movidius_urb);
     }
@@ -323,15 +373,21 @@ struct batch_inference_request {
     __u64 reqs;
 };
 
+struct batch_completion {
+    struct completion completion;
+    atomic_t pending_reqs;
+};
+
 struct internal_inference_request {
     struct list_head list;
     struct io_uring_cmd *ioucmd;
-    size_t input_offset;
-    size_t input_size;
-    size_t output_offset;
-    size_t output_size;
+    __u32 num_input_segs;
+    __u32 num_output_segs;
+    struct movidius_sg_segment input_segs[MAX_SG_SEGMENTS];
+    struct movidius_sg_segment output_segs[MAX_SG_SEGMENTS];
     u64 user_data;
-    struct completion completion;
+    struct scatterlist *sg;
+    struct batch_completion *batch;
 };
 
 static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int issue_flags)
@@ -343,24 +399,47 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
     switch (ioucmd->cmd.opcode) {
     case MOVIDIUS_URING_CMD_SUBMIT_INFERENCE: {
         const struct inference_request __user *user_req = (const struct inference_request __user *)(uintptr_t)ioucmd->cmd.addr;
+        int i;
+        struct batch_completion *batch;
+
         req = kzalloc(sizeof(*req), GFP_KERNEL);
         if (!req)
             return -ENOMEM;
 
-        if (copy_from_user(&req->input_offset, user_req, sizeof(struct inference_request))) {
+        if (copy_from_user(req, user_req, sizeof(struct inference_request))) {
             kfree(req);
             return -EFAULT;
         }
 
-        if (req->input_offset + req->input_size > DMA_BUFFER_SIZE ||
-            req->output_offset + req->output_size > DMA_BUFFER_SIZE) {
+        if (req->num_input_segs > MAX_SG_SEGMENTS || req->num_output_segs > MAX_SG_SEGMENTS) {
             kfree(req);
             return -EINVAL;
         }
 
+        for (i = 0; i < req->num_input_segs; i++) {
+            if (req->input_segs[i].offset + req->input_segs[i].len > DMA_BUFFER_SIZE) {
+                kfree(req);
+                return -EINVAL;
+            }
+        }
+
+        for (i = 0; i < req->num_output_segs; i++) {
+            if (req->output_segs[i].offset + req->output_segs[i].len > DMA_BUFFER_SIZE) {
+                kfree(req);
+                return -EINVAL;
+            }
+        }
+
+        batch = kzalloc(sizeof(*batch), GFP_KERNEL);
+        if (!batch) {
+            kfree(req);
+            return -ENOMEM;
+        }
+        init_completion(&batch->completion);
+        atomic_set(&batch->pending_reqs, 1);
+        req->batch = batch;
+
         req->ioucmd = ioucmd;
-        init_completion(&req->completion);
-        atomic_inc(&dev->pending_reqs);
         io_uring_cmd_set_user_data(ioucmd, req->user_data);
 
         spin_lock_irqsave(&dev->request_queue_lock, flags);
@@ -373,7 +452,8 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
     case MOVIDIUS_URING_CMD_SUBMIT_BATCH: {
         struct batch_inference_request batch_req;
         struct inference_request __user *user_reqs;
-        int i;
+        struct batch_completion *batch;
+        int i, j;
 
         if (copy_from_user(&batch_req, (void __user *)(uintptr_t)ioucmd->cmd.addr, sizeof(batch_req)))
             return -EFAULT;
@@ -381,27 +461,50 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
         if (batch_req.count > URB_POOL_SIZE)
             return -EINVAL;
 
+        batch = kzalloc(sizeof(*batch), GFP_KERNEL);
+        if (!batch)
+            return -ENOMEM;
+        init_completion(&batch->completion);
+        atomic_set(&batch->pending_reqs, batch_req.count);
+
         user_reqs = (struct inference_request __user *)(uintptr_t)batch_req.reqs;
 
         for (i = 0; i < batch_req.count; i++) {
             req = kzalloc(sizeof(*req), GFP_KERNEL);
-            if (!req)
+            if (!req) {
+                kfree(batch);
                 return -ENOMEM;
+            }
 
-            if (copy_from_user(&req->input_offset, &user_reqs[i], sizeof(struct inference_request))) {
+            if (copy_from_user(req, &user_reqs[i], sizeof(struct inference_request))) {
                 kfree(req);
+                kfree(batch);
                 return -EFAULT;
             }
 
-            if (req->input_offset + req->input_size > DMA_BUFFER_SIZE ||
-                req->output_offset + req->output_size > DMA_BUFFER_SIZE) {
+            if (req->num_input_segs > MAX_SG_SEGMENTS || req->num_output_segs > MAX_SG_SEGMENTS) {
                 kfree(req);
+                kfree(batch);
                 return -EINVAL;
             }
 
+            for (j = 0; j < req->num_input_segs; j++) {
+                if (req->input_segs[j].offset + req->input_segs[j].len > DMA_BUFFER_SIZE) {
+                    kfree(req);
+                    kfree(batch);
+                    return -EINVAL;
+                }
+            }
+
+            for (j = 0; j < req->num_output_segs; j++) {
+                if (req->output_segs[j].offset + req->output_segs[j].len > DMA_BUFFER_SIZE) {
+                    kfree(req);
+                    kfree(batch);
+                    return -EINVAL;
+                }
+            }
+            req->batch = batch;
             req->ioucmd = ioucmd;
-            init_completion(&req->completion);
-            atomic_inc(&dev->pending_reqs);
             io_uring_cmd_set_user_data(ioucmd, req->user_data);
 
             spin_lock_irqsave(&dev->request_queue_lock, flags);
