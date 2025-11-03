@@ -6,6 +6,8 @@
 #include <linux/device.h>
 #include <linux/uaccess.h>
 #include <linux/io_uring.h>
+#include <linux/moduleparam.h>
+#include <linux/interrupt.h>
 
 #define VENDOR_ID_INTEL 0x03e7
 #define PRODUCT_ID_MYRIAD_X 0x2485
@@ -15,6 +17,14 @@ static struct usb_device_id movidius_x_vpu_table[] = {
     {} /* Terminating entry */
 };
 MODULE_DEVICE_TABLE(usb, movidius_x_vpu_table);
+
+static int submission_cpu = -1;
+module_param(submission_cpu, int, 0644);
+MODULE_PARM_DESC(submission_cpu, "The CPU to bind the submission thread to. -1 for unbound.");
+
+static int irq_cpu = -1;
+module_param(irq_cpu, int, 0644);
+MODULE_PARM_DESC(irq_cpu, "The CPU to affinitize USB interrupts to. -1 for unbound.");
 
 #define MAX_DEV 1
 
@@ -389,6 +399,21 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
     if (start_submission_thread(dev)) {
         printk(KERN_ERR "start_submission_thread failed\n");
         goto error_urb_pool;
+    }
+
+    if (submission_cpu != -1 && submission_cpu < num_possible_cpus()) {
+        kthread_bind(dev->submission_thread, submission_cpu);
+        printk(KERN_INFO "Submission thread bound to CPU %d\n", submission_cpu);
+    }
+
+    if (irq_cpu != -1 && irq_cpu < num_possible_cpus()) {
+        struct usb_hcd *hcd = bus_to_hcd(dev->udev->bus);
+        if (hcd->irq > 0) {
+            if (irq_set_affinity_hint(hcd->irq, cpumask_of(irq_cpu)) == 0)
+                printk(KERN_INFO "IRQ %d affinity set to CPU %d\n", hcd->irq, irq_cpu);
+            else
+                printk(KERN_WARNING "Failed to set IRQ affinity for IRQ %d\n", hcd->irq);
+        }
     }
 
     cdev_init(&dev->cdev, &movidius_x_vpu_fops);

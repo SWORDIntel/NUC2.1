@@ -82,7 +82,7 @@ int main()
         iov.iov_base = req;
         iov.iov_len = sizeof(*req);
         io_uring_prep_rw(IORING_OP_URING_CMD, sqe, fd, &iov, 1, 0);
-        sqe->opcode = MOVIDIUS_URING_CMD_SUBMIT_INFERENCE;
+        sqe->uring_cmd_opcode = MOVIDIUS_URING_CMD_SUBMIT_INFERENCE;
         io_uring_sqe_set_data(sqe, (void *)(uintptr_t)req->user_data);
     }
 
@@ -102,7 +102,6 @@ int main()
         }
         printf("Inference complete for request with user_data = %lu, result = %d\n",
                (unsigned long)cqe->user_data, cqe->res);
-        free((void *)(uintptr_t)cqe->user_data);
         io_uring_cqe_seen(&ring, cqe);
     }
 

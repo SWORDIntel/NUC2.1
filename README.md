@@ -37,6 +37,21 @@ sudo insmod movidius_x_vpu.ko
 
 The driver will create a character device at `/dev/movidius_x_vpu`.
 
+### Performance Tuning
+
+The driver exposes two module parameters that can be used for performance tuning:
+
+*   `submission_cpu`: The CPU to bind the submission thread to. Pinning the submission thread to a specific CPU can improve cache locality and reduce context switching.
+*   `irq_cpu`: The CPU to affinitize USB interrupts to. Pinning USB interrupts to a specific CPU can reduce interrupt latency and improve throughput.
+
+To use these parameters, specify them when loading the driver:
+
+```bash
+sudo insmod movidius_x_vpu.ko submission_cpu=2 irq_cpu=3
+```
+
+For best performance, it is recommended to bind the submission thread and USB interrupts to different CPUs on the same NUMA node as the USB host controller.
+
 ## Building and Running the Test Application
 
 ### Building
