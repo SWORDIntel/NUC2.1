@@ -170,8 +170,8 @@ static int submission_thread_func(void *data)
             list_del(&req->list);
             spin_unlock_irq(&dev->request_queue_lock);
 
-            printk(KERN_INFO "Processing inference request: input_offset=%zu, input_size=%zu, output_offset=%zu, output_size=%zu, seq=%llu\n",
-                   req->input_offset, req->input_size, req->output_offset, req->output_size, req->seq);
+            printk(KERN_INFO "Processing inference request: input_offset=%zu, input_size=%zu, output_offset=%zu, output_size=%zu, user_data=%llu\n",
+                   req->input_offset, req->input_size, req->output_offset, req->output_size, req->user_data);
 
             movidius_urb->direction = MOVIDIUS_URB_OUT;
             movidius_urb->req = req;
@@ -190,10 +190,9 @@ static int submission_thread_func(void *data)
             ret = usb_submit_urb(movidius_urb->urb, GFP_KERNEL);
             if (ret) {
                 printk(KERN_ERR "Failed to submit URB: %d\n", ret);
-                return_urb_to_pool(dev, movidius_urb);
-                eventfd_signal(req->eventfd_ctx, 1);
-                eventfd_ctx_put(req->eventfd_ctx);
+                io_uring_cmd_done(req->ioucmd, ret, 0);
                 kfree(req);
+                return_urb_to_pool(dev, movidius_urb);
                 /* Continue to the next request */
             }
         }
@@ -328,6 +327,12 @@ static int movidius_x_vpu_uring_cmd(struct io_uring_cmd *ioucmd, unsigned int is
             return -EFAULT;
         }
 
+        if (req->input_offset + req->input_size > DMA_BUFFER_SIZE ||
+            req->output_offset + req->output_size > DMA_BUFFER_SIZE) {
+            kfree(req);
+            return -EINVAL;
+        }
+
         req->ioucmd = ioucmd;
         io_uring_cmd_set_user_data(ioucmd, req->user_data);
 
@@ -416,9 +421,10 @@ static int movidius_x_vpu_probe(struct usb_interface *interface, const struct us
         goto error_submission_thread;
     }
 
-    if (IS_ERR(device_create(movidius_class, NULL, dev_num, NULL, "movidius_x_vpu"))) {
+    struct device *device = device_create(movidius_class, NULL, dev_num, NULL, "movidius_x_vpu");
+    if (IS_ERR(device)) {
         printk(KERN_ERR "device_create failed\n");
-        ret = PTR_ERR(device_create(movidius_class, NULL, dev_num, NULL, "movidius_x_vpu"));
+        ret = PTR_ERR(device);
         goto error_cdev;
     }
 

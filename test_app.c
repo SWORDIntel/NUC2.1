@@ -102,6 +102,7 @@ int main()
         }
         printf("Inference complete for request with user_data = %lu, result = %d\n",
                (unsigned long)cqe->user_data, cqe->res);
+        free((void *)(uintptr_t)cqe->user_data);
         io_uring_cqe_seen(&ring, cqe);
     }
 
