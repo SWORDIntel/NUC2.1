@@ -7,9 +7,18 @@
 #include <liburing.h>
 #include <sys/ioctl.h>
 #include <stdint.h>
+#include <dirent.h>
 
 #define MOVIDIUS_UAPI_VERSION 1
 #define MAX_SG_SEGMENTS 16
+
+#define MOVIDIUS_IOCTL_REGISTER_DMA_ARENA _IOW('M', 1, struct movidius_dma_arena)
+#define MOVIDIUS_IOCTL_UNREGISTER_DMA_ARENA _IO('M', 2)
+
+struct movidius_dma_arena {
+    uint64_t addr;
+    uint64_t len;
+};
 
 struct movidius_sg_segment {
     uint32_t offset;
@@ -29,14 +38,6 @@ struct inference_request {
     struct movidius_sg_segment input_segs[MAX_SG_SEGMENTS];
     struct movidius_sg_segment output_segs[MAX_SG_SEGMENTS];
     uint64_t user_data;
-};
-
-#define MOVIDIUS_IOCTL_REGISTER_DMA_ARENA _IOW('M', 1, struct movidius_dma_arena)
-#define MOVIDIUS_IOCTL_UNREGISTER_DMA_ARENA _IO('M', 2)
-
-struct movidius_dma_arena {
-    uint64_t addr;
-    uint64_t len;
 };
 
 struct batch_inference_request {
@@ -134,45 +135,47 @@ int main(int argc, char *argv[]) {
         }
 
         for (int i = 0; i < batch_size; i++) {
-        infer_reqs[i] = (struct inference_request){
-            .hdr = {.version = MOVIDIUS_UAPI_VERSION, .op = 0, .len = sizeof(struct inference_request)},
-            .num_input_segs = 1,
-            .num_output_segs = 1,
-            .input_segs = {{.offset = i * 2048, .len = 1024}},
-            .output_segs = {{.offset = i * 2048 + 1024, .len = 1024}},
-            .user_data = 0xdeadbeef + i,
-        };
-        memset(dma_buffer + i * 2048, 0xAA + i, 1024);
-    }
-
-    struct batch_inference_request batch_req = {
-        .hdr = {.version = MOVIDIUS_UAPI_VERSION, .op = 0, .len = sizeof(batch_req)},
-        .count = batch_size,
-        .reqs = (uint64_t)(uintptr_t)infer_reqs,
-    };
-
-    sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_uring_cmd(sqe, MOVIDIUS_URING_CMD_SUBMIT_BATCH, fds[j % num_devices]);
-    sqe->addr = (uint64_t)(uintptr_t)&batch_req;
-    sqe->len = sizeof(batch_req);
-    io_uring_sqe_set_data(sqe, (void *)2);
-
-    ret = io_uring_submit(&ring);
-    if (ret < 0) {
-        fprintf(stderr, "io_uring_submit failed: %d\n", ret);
-    }
-
-    ret = io_uring_wait_cqe(&ring, &cqe);
-    if (ret < 0) {
-        fprintf(stderr, "io_uring_wait_cqe failed: %d\n", ret);
-    } else {
-        if (cqe->res < 0) {
-            fprintf(stderr, "Inference failed: %s\n", strerror(-cqe->res));
-        } else {
-            printf("Inference batch %d successful.\n", j);
+            infer_reqs[i] = (struct inference_request){
+                .hdr = {.version = MOVIDIUS_UAPI_VERSION, .op = 0, .len = sizeof(struct inference_request)},
+                .num_input_segs = 1,
+                .num_output_segs = 1,
+                .input_segs = {{.offset = i * 2048, .len = 1024}},
+                .output_segs = {{.offset = i * 2048 + 1024, .len = 1024}},
+                .user_data = 0xdeadbeef + i,
+            };
+            memset(dma_buffer + i * 2048, 0xAA + i, 1024);
         }
-        io_uring_cqe_seen(&ring, cqe);
-        free(infer_reqs);
+
+        struct batch_inference_request batch_req = {
+            .hdr = {.version = MOVIDIUS_UAPI_VERSION, .op = 0, .len = sizeof(batch_req)},
+            .count = batch_size,
+            .reqs = (uint64_t)(uintptr_t)infer_reqs,
+        };
+
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+        io_uring_prep_uring_cmd(sqe, MOVIDIUS_URING_CMD_SUBMIT_BATCH, fds[j % num_devices]);
+        sqe->addr = (uint64_t)(uintptr_t)&batch_req;
+        sqe->len = sizeof(batch_req);
+        io_uring_sqe_set_data(sqe, (void *)2);
+
+        ret = io_uring_submit(&ring);
+        if (ret < 0) {
+            fprintf(stderr, "io_uring_submit failed: %d\n", ret);
+        }
+
+        struct io_uring_cqe *cqe;
+        ret = io_uring_wait_cqe(&ring, &cqe);
+        if (ret < 0) {
+            fprintf(stderr, "io_uring_wait_cqe failed: %d\n", ret);
+        } else {
+            if (cqe->res < 0) {
+                fprintf(stderr, "Inference failed: %s\n", strerror(-cqe->res));
+            } else {
+                printf("Inference batch %d successful.\n", j);
+            }
+            io_uring_cqe_seen(&ring, cqe);
+            free(infer_reqs);
+        }
     }
 
     printf("Unregistering DMA buffer...\n");

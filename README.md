@@ -1,201 +1,63 @@
-# High-Performance Linux Driver for Intel Movidius Myriad X VPU
+# Movidius Myriad X VPU Linux Driver
 
-This repository contains a custom, high-performance Linux kernel driver for the Intel Movidius Myriad X VPU. The driver is designed to provide a low-latency, high-throughput interface for submitting inference requests to the VPU, making it suitable for demanding machine learning applications.
+This is a custom high-performance Linux kernel driver for the Intel Movidius Myriad X VPU, designed for low-latency, high-throughput deep learning inference.
 
-## Performance Features & Expected Gains
+## Features
 
-This driver implements several advanced features to maximize performance. The following are architectural estimates of the expected gains and have not been confirmed by benchmarking.
+This driver implements several advanced features to maximize the performance of the Myriad X VPU:
 
-*   **Zero-Copy Data Path (User-Managed DMA Arenas):**
-    *   **What:** User-space applications can allocate large memory arenas and register them with the driver. The driver pins this memory and uses it directly for hardware DMA, eliminating all memory copies between user and kernel space.
-    *   **Why:** Eliminates expensive `memcpy` operations on every inference input/output.
-    *   **Expected Gain:** CPU usage reduction 25–80% on I/O heavy workloads; per-inference latency reduction of ~1–5 ms.
+1.  **Zero-Copy Data Path**: The driver utilizes `pin_user_pages` and a custom `ioctl` (`MOVIDIUS_IOCTL_REGISTER_DMA_ARENA`) to map user-space buffers directly into the kernel address space. This allows the USB hardware to perform DMA directly from user memory, eliminating all intermediate copies (`memcpy`) between user and kernel space for inference data. This significantly reduces CPU overhead and per-inference latency.
 
-*   **Asynchronous URB Pooling:**
-    *   **What:** A persistent pool of USB Request Blocks (URBs) is pre-allocated and reused for all transfers.
-    *   **Why:** Avoids the overhead of allocating and freeing URBs for each request.
-    *   **Expected Gain:** Throughput increase of ~10–40% in steady state and reduced tail latency.
+2.  **`io_uring` Interface**: The driver exposes a modern, high-performance `io_uring` interface for submitting inference requests. This is a true asynchronous, low-latency queue that minimizes syscall overhead, context switches, and locks, dramatically improving requests-per-second (QPS) for small models.
 
-*   **Batch Submission & Adaptive Batching:**
-    *   **What:** Multiple inference requests are intelligently grouped into a single, large USB transfer. Batching is triggered by either a configurable time delay (`batch_delay_ms`) or a request count high-water mark (`batch_high_watermark`).
-    *   **Why:** Improves USB bus utilization and adapts to varying workloads to balance throughput and latency.
-    *   **Expected Gain:** Effective throughput (inferences/sec) increase of 2x–5x.
+3.  **Batch Submission & Adaptive Batching**: The driver supports batching multiple inference requests into a single `io_uring` command (`MOVIDIUS_URING_CMD_SUBMIT_BATCH`). Furthermore, it implements an adaptive batching strategy in the kernel. A timer (`batch_delay_ms`) and a queue depth threshold (`batch_high_watermark`) are used to dynamically decide when to dispatch a batch, balancing the tradeoff between latency (for small batches) and throughput (for large batches). This allows the driver to maximize device utilization and overall throughput without violating latency SLOs under varying loads.
 
-*   **Composite Device Optimizations:**
-    *   **What:** The driver includes a built-in round-robin scheduler that automatically distributes inference requests across all available Movidius VPUs in the system.
-    *   **Why:** This enables near-linear performance scaling with multiple devices and simplifies the user-space application, which no longer needs to manage multiple device handles.
-    *   **Expected Gain:** Near-linear scaling up to the limits of the USB hub/controller (typically 3-6 devices).
+4.  **Persistent URB Pool & Asynchronous Submission**: A pool of USB Request Blocks (URBs) is pre-allocated at driver initialization and reused for all data transfers. Requests are submitted asynchronously from a dedicated kernel thread, which fetches pending requests from the `io_uring` queue. This avoids the overhead of allocating/freeing URBs and making blocking submissions for every inference.
 
-*   **Low-Latency `io_uring` Interface:**
-    *   **What:** The driver uses the modern `io_uring` interface for request submission and completion.
-    *   **Why:** Minimizes syscall overhead and context switches.
-    *   **Expected Gain:** Combined with zero-copy, can double effective QPS for small models.
+5.  **Multi-Device Coordination & Scheduling**: The driver can manage multiple Myriad X VPUs simultaneously. It creates a character device for each VPU found. A round-robin scheduling policy is used to distribute inference requests across all available devices, improving aggregate throughput.
 
-## Multi-Device Operation & Scheduling
+6.  **NUMA/CPU Affinity & IRQ Balancing**: The driver's submission thread and the USB controller's interrupt requests (IRQs) can be pinned to specific CPU cores using module parameters (`submission_cpu_affinity`, `usb_irq_affinity`). This improves cache locality and reduces cross-socket memory traffic, leading to lower latency jitter and better performance under heavy load.
 
-The driver is designed to work with multiple Movidius VPUs in a single system. It includes a built-in round-robin scheduler that automatically distributes inference requests across all available devices. A master device node, `/dev/movidius_master`, is created to act as a unified entry point for submitting inference requests. When a request is submitted to the master device, the driver will automatically select the next available device to process the request. This provides a simple and effective load balancing mechanism, and simplifies the user-space application, which does not need to be aware of the number of devices in the system.
+7.  **Sysfs Telemetry**: Key performance metrics and device status are exposed via `sysfs`. This includes queue depth, device temperature, and performance counters, allowing for real-time monitoring and integration with external schedulers or thermal management daemons.
 
-## Benchmarking
+## Building the Driver
 
-A benchmark application, `benchmark.c`, is included to measure the performance of the driver.
-
-### Building the Benchmark
-
-To build the benchmark, run `make` with the `Makefile.benchmark` file:
+**Prerequisites**:
+*   Linux kernel headers for your running kernel version.
+*   `liburing` development library.
 
 ```bash
-make -f Makefile.benchmark
-```
-
-### Running the Benchmark
-
-To run the benchmark, simply execute the `benchmark` binary:
-
-```bash
-./benchmark
-```
-
-The benchmark will allocate and register a large DMA arena, launch multiple threads to submit batches of inference requests to the master device, and measure the total time and inferences per second.
-
-## Recommended System Configuration
-
-For optimal performance, the following system configuration is recommended:
-
-*   **Multiple Movidius VPUs:** The driver is designed to scale with multiple devices. Using 2 or more VPUs will significantly improve throughput.
-*   **64GB or more of RAM:** A large amount of RAM allows for the creation of large, persistent DMA arenas, which can further improve performance by reducing memory management overhead.
-*   **A modern Linux kernel (5.10+):** A recent kernel is required for the best `io_uring` performance and features.
-*   **NUMA affinity:** For best performance, it is recommended to bind the submission thread and USB interrupts to different CPUs on the same NUMA node as the USB host controller.
-
-## Building and Installing the Driver
-
-### Prerequisites
-
-*   A Linux kernel with `io_uring` support (5.1 or later).
-*   The kernel headers for your running kernel.
-*   `liburing-dev` installed.
-
-### Building
-
-To build the driver, simply run `make`:
-
-```bash
+# Build the kernel module
 make
+
+# Build the test application
+make test
 ```
 
-This will produce a kernel module file named `movidius_x_vpu.ko`.
+## Usage
 
-### Installing
+1.  **Load the driver**:
+    ```bash
+    sudo insmod movidius_x_vpu.ko
+    ```
+    You can specify module parameters to customize behavior:
+    ```bash
+    sudo insmod movidius_x_vpu.ko vendor_id=0x03e7 product_id=0x2485 submission_cpu_affinity=4 usb_irq_affinity=5
+    ```
 
-To install the driver, run the following command:
+2.  **Verify device creation**:
+    Check for the presence of `/dev/movidius_x_vpu[0-9]` device nodes.
+    ```bash
+    ls /dev/movidius*
+    ```
 
-```bash
-sudo insmod movidius_x_vpu.ko
-```
+3.  **Run the test application**:
+    The test application demonstrates how to register a DMA buffer and submit inference requests using `io_uring`.
+    ```bash
+    ./test_app
+    ```
 
-The driver will create a character device at `/dev/movidius_x_vpu`.
+## `io_uring` Interface Details
 
-### Performance Tuning
-
-The driver exposes two module parameters that can be used for performance tuning:
-
-*   `submission_cpu`: The CPU to bind the submission thread to. Pinning the submission thread to a specific CPU can improve cache locality and reduce context switching.
-*   `irq_cpu`: The CPU to affinitize USB interrupts to. Pinning USB interrupts to a specific CPU can reduce interrupt latency and improve throughput.
-*   `batch_delay_ms`: The maximum time in ms to wait for a batch to fill up. Increasing this value can improve throughput at the cost of increased latency.
-*   `batch_high_watermark`: The number of requests in the queue that will trigger an immediate batch submission.
-
-To use these parameters, specify them when loading the driver:
-
-```bash
-sudo insmod movidius_x_vpu.ko submission_cpu=2 irq_cpu=3
-```
-
-For best performance, it is recommended to bind the submission thread and USB interrupts to different CPUs on the same NUMA node as the USB host controller.
-
-## Building and Running the Test Application
-
-### Building
-
-To build the test application, run `make` with the `Makefile.test` file:
-
-```bash
-make -f Makefile.test
-```
-
-This will produce an executable file named `test_app`.
-
-### Running
-
-To run the test application, simply execute the `test_app` binary:
-
-```bash
-./test_app
-```
-
-The test application will submit a batch of inference requests to the driver and print a message to the console when each request is complete.
-
-To list the available devices, use the `--list` command-line option:
-
-```bash
-./test_app --list
-```
-
-### udev Rule
-
-To allow non-root users to access the device, you can add the following `udev` rule to `/etc/udev/rules.d/99-movidius.rules`:
-
-```
-SUBSYSTEM=="usb", ATTR{idVendor}=="03e7", ATTR{idProduct}=="2485", MODE="0660", GROUP="plugdev", SYMLINK+="movidius_x_vpu%n"
-```
-
-## Scatter-Gather DMA
-
-The driver supports scatter-gather DMA, which allows a single inference request to be composed of multiple, non-contiguous memory buffers. This is useful for complex neural networks where different inputs or layers may be prepared in separate memory regions.
-
-### Data Structures
-
-To use scatter-gather DMA, you need to populate the `inference_request` struct with an array of `movidius_sg_segment` structs.
-
-```c
-#define MAX_SG_SEGMENTS 16
-
-struct movidius_sg_segment {
-    __u32 offset;
-    __u32 len;
-};
-
-struct inference_request {
-    __u32 num_input_segs;
-    __u32 num_output_segs;
-    struct movidius_sg_segment input_segs[MAX_SG_SEGMENTS];
-    struct movidius_sg_segment output_segs[MAX_SG_SEGMENTS];
-    u64 user_data;
-};
-```
-
-### Example
-
-Here is an example of how to prepare and submit an inference request with two input segments and one output segment:
-
-```c
-/* Prepare a request with 2 input segments and 1 output segment */
-req->num_input_segs = 2;
-req->num_output_segs = 1;
-
-/* First input segment */
-strcpy(dma_buffer, "Hello from ");
-req->input_segs[0].offset = 0;
-req->input_segs[0].len = strlen("Hello from ");
-
-/* Second input segment */
-strcpy(dma_buffer + 1024, "user space!");
-req->input_segs[1].offset = 1024;
-req->input_segs[1].len = strlen("user space!");
-
-/* Output segment */
-req->output_segs[0].offset = 2048;
-req->output_segs[0].len = 128;
-
-req->user_data = 1;
-
-/* Submit the request using io_uring */
-```
+*   **`MOVIDIUS_URING_CMD_SUBMIT_INFERENCE`**: Submits a single inference request. `addr` points to a `struct inference_request`.
+*   **`MOVIDIUS_URING_CMD_SUBMIT_BATCH`**: Submits a batch of requests. `addr` points to a `struct batch_inference_request`.
