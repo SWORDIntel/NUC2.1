@@ -192,6 +192,31 @@ cargo run --example basic_inference
 cargo doc --open
 ```
 
+## Testing with Physical Devices
+
+This implementation includes comprehensive test scripts for physical Movidius Neural Compute Sticks.
+
+**Recommended Setup: 2 Devices** - Testing with dual devices allows validation of:
+- **Memory pooling** across devices (alleged performance benefit)
+- **Parallel inference** with ~2x throughput
+- **Resource contention** handling
+- **Multi-device state management**
+
+### Quick Test Commands
+
+```bash
+# Check device status
+./scripts/check_devices.sh
+
+# Test single device
+./scripts/test_single_device.sh
+
+# Test dual devices (recommended for full validation)
+./scripts/test_dual_device.sh
+```
+
+See `scripts/README.md` for complete testing documentation, including troubleshooting and performance expectations.
+
 ## Performance Benchmarks
 
 ### FP32 → FP16 Conversion (AVX2)
