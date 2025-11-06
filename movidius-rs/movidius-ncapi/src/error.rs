@@ -18,6 +18,10 @@ pub enum Error {
     #[error("Invalid state transition: {0}")]
     InvalidState(String),
 
+    /// Invalid argument
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
     /// Resource exhausted
     #[error("Resource exhausted: {0}")]
     ResourceExhausted(String),
@@ -25,6 +29,10 @@ pub enum Error {
     /// Hardware error
     #[error("Hardware error: {0}")]
     Hardware(String),
+
+    /// Device error
+    #[error("Device error: {0}")]
+    DeviceError(String),
 
     /// Other error
     #[error("{0}")]
@@ -38,8 +46,10 @@ impl Error {
             Self::Status(s) => *s,
             Self::Io(_) => Status::Error,
             Self::InvalidState(_) => Status::InvalidParameters,
+            Self::InvalidArgument(_) => Status::InvalidParameters,
             Self::ResourceExhausted(_) => Status::OutOfMemory,
             Self::Hardware(_) => Status::MyriadError,
+            Self::DeviceError(_) => Status::DeviceNotFound,
             Self::Other(_) => Status::Error,
         }
     }

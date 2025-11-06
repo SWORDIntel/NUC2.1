@@ -128,33 +128,90 @@ impl Device {
     /// Get thermal statistics (temperature in Celsius)
     /// Returns (current_temp, max_temp)
     pub fn thermal_stats(&self) -> Result<(f32, f32)> {
-        // TODO: Actual ioctl to read temperature
-        // For now, return placeholder values
-        tracing::trace!("Reading thermal stats for device {}", self.index);
-        Ok((45.0, 85.0)) // Mock: current 45°C, max 85°C
+        let fd = self.fd.ok_or_else(|| {
+            Error::InvalidState("Device not opened".to_string())
+        })?;
+
+        let thermal_info = movidius_hal::IoctlInterface::get_thermal(fd)
+            .map_err(|e| Error::Hardware(format!("Failed to get thermal stats: {}", e)))?;
+
+        tracing::trace!(
+            "Device {} thermal: {}°C (max {}°C, throttle={})",
+            self.index,
+            thermal_info.current_temp,
+            thermal_info.max_temp,
+            thermal_info.throttle_level
+        );
+
+        Ok((thermal_info.current_temp, thermal_info.max_temp))
     }
 
     /// Get current thermal throttling level
     pub fn throttling_level(&self) -> Result<crate::config::thermal::ThrottleLevel> {
-        // TODO: Actual ioctl to read throttling status
-        tracing::trace!("Reading throttling level for device {}", self.index);
-        Ok(crate::config::thermal::ThrottleLevel::None)
+        let fd = self.fd.ok_or_else(|| {
+            Error::InvalidState("Device not opened".to_string())
+        })?;
+
+        let thermal_info = movidius_hal::IoctlInterface::get_thermal(fd)
+            .map_err(|e| Error::Hardware(format!("Failed to get throttling level: {}", e)))?;
+
+        let level = match thermal_info.throttle_level {
+            0 => crate::config::thermal::ThrottleLevel::None,
+            1 => crate::config::thermal::ThrottleLevel::Lower,
+            2 => crate::config::thermal::ThrottleLevel::Upper,
+            _ => crate::config::thermal::ThrottleLevel::Upper, // Treat unknown as worst case
+        };
+
+        tracing::trace!("Device {} throttling: {:?}", self.index, level);
+        Ok(level)
     }
 
     /// Get current memory usage statistics
     /// Returns (used_bytes, total_bytes)
     pub fn memory_usage(&self) -> Result<(u64, u64)> {
-        // TODO: Actual ioctl to read memory stats
-        tracing::trace!("Reading memory usage for device {}", self.index);
-        Ok((0, 512 * 1024 * 1024)) // Mock: 512MB total
+        let fd = self.fd.ok_or_else(|| {
+            Error::InvalidState("Device not opened".to_string())
+        })?;
+
+        let mem_info = movidius_hal::IoctlInterface::get_memory_usage(fd)
+            .map_err(|e| Error::Hardware(format!("Failed to get memory usage: {}", e)))?;
+
+        tracing::trace!(
+            "Device {} memory: {} / {} bytes ({:.1}%)",
+            self.index,
+            mem_info.used,
+            mem_info.total,
+            (mem_info.used as f64 / mem_info.total as f64) * 100.0
+        );
+
+        Ok((mem_info.used, mem_info.total))
     }
 
     /// Get resource allocation counts
     /// Returns (allocated_graphs, max_graphs, allocated_fifos, max_fifos)
     pub fn resource_counts(&self) -> Result<(u32, u32, u32, u32)> {
-        // TODO: Actual ioctl to read resource counts
-        tracing::trace!("Reading resource counts for device {}", self.index);
-        Ok((0, 10, 0, 20)) // Mock values
+        let fd = self.fd.ok_or_else(|| {
+            Error::InvalidState("Device not opened".to_string())
+        })?;
+
+        let res_info = movidius_hal::IoctlInterface::get_resources(fd)
+            .map_err(|e| Error::Hardware(format!("Failed to get resource counts: {}", e)))?;
+
+        tracing::trace!(
+            "Device {} resources: graphs {}/{}, fifos {}/{}",
+            self.index,
+            res_info.graphs_allocated,
+            res_info.graphs_max,
+            res_info.fifos_allocated,
+            res_info.fifos_max
+        );
+
+        Ok((
+            res_info.graphs_allocated,
+            res_info.graphs_max,
+            res_info.fifos_allocated,
+            res_info.fifos_max,
+        ))
     }
 
     /// Check if device is healthy (not throttling, memory OK)

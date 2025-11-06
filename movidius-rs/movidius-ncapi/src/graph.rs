@@ -163,3 +163,26 @@ impl Graph {
         self.state
     }
 }
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        tracing::debug!("Dropping graph '{}' (state: {:?})", self.name, self.state);
+
+        // Note: FIFOs associated with this graph should be dropped BEFORE the graph
+        // This is enforced by Rust's drop order when FIFOs are created via allocate_with_fifos
+        // (FIFOs are dropped first since they're returned/stored separately)
+
+        if self.state == GraphState::Running {
+            tracing::warn!(
+                "Graph '{}' dropped while in Running state - may cause device issues",
+                self.name
+            );
+        }
+
+        // Device reference is dropped automatically (Arc)
+        // This is safe because device outlives graph
+        self.state = GraphState::Created; // Reset for cleanup
+
+        tracing::trace!("Graph '{}' cleanup complete", self.name);
+    }
+}

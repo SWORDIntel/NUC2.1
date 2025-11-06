@@ -11,7 +11,7 @@ pub mod uring;
 pub mod usb;
 
 pub use dma::DmaArena;
-pub use ioctl::{DeviceInfo, IoctlInterface};
+pub use ioctl::{DeviceInfo, IoctlInterface, MemoryUsage, ResourceInfo, ThermalInfo};
 pub use uring::UringSubmitter;
 
 /// Result type for HAL operations

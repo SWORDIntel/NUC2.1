@@ -385,8 +385,24 @@ impl Fifo {
 
 impl Drop for Fifo {
     fn drop(&mut self) {
-        // Ensure queue is drained before dropping
+        tracing::debug!("Dropping FIFO '{}' (state: {:?})", self.name, self.state);
+
+        // Drain queue before dropping
+        let drained = self.queue.len();
         while self.queue.pop().is_some() {}
+
+        if drained > 0 {
+            tracing::warn!(
+                "FIFO '{}' dropped with {} unprocessed elements",
+                self.name,
+                drained
+            );
+        }
+
+        // Transition to destroyed state
+        self.state = FifoState::Created; // Reset for cleanup
+
+        tracing::trace!("FIFO '{}' cleanup complete", self.name);
     }
 }
 
