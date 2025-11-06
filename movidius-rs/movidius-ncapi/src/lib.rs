@@ -5,6 +5,7 @@
 #![warn(missing_docs, rust_2018_idioms, clippy::all, clippy::perf)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod config;
 pub mod conversion;
 pub mod device;
 pub mod error;

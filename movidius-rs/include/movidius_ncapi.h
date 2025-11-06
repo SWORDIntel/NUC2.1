@@ -5,6 +5,89 @@
 
 #define MAX_NAME_SIZE 28
 
+/**
+ * Optimal number of threads per device for Myriad X
+ * Myriad X has 2 NCEs and performs best with 3 threads
+ */
+#define THREADS_PER_DEVICE 3
+
+/**
+ * Number of simultaneous async inference requests per thread
+ */
+#define ASYNC_REQUESTS_PER_THREAD 6
+
+/**
+ * Total concurrent requests per device (3 × 6 = 18)
+ */
+#define TOTAL_REQUESTS_PER_DEVICE (THREADS_PER_DEVICE * ASYNC_REQUESTS_PER_THREAD)
+
+/**
+ * Default FIFO depth (optimal for most workloads)
+ */
+#define DEFAULT_DEPTH 4
+
+/**
+ * Minimum recommended FIFO depth
+ */
+#define MIN_DEPTH 2
+
+/**
+ * Maximum practical FIFO depth before diminishing returns
+ */
+#define MAX_DEPTH 10
+
+/**
+ * Result queue size for consumer threads (from benchmark_ncs.py)
+ */
+#define RESULT_QUEUE_SIZE 6
+
+/**
+ * Enable hardware pipeline optimization
+ * WARNING: Requires models compiled with --scale (4, 8, or 16)
+ * Can cause precision issues with half-precision overflow otherwise
+ */
+#define HW_STAGES_OPTIMIZATION true
+
+/**
+ * Enable reshape optimization
+ */
+#define RESHAPE_OPTIMIZATION false
+
+/**
+ * Memory usage warning threshold (percentage)
+ */
+#define MEMORY_WARNING_THRESHOLD 80
+
+/**
+ * Memory usage critical threshold (percentage)
+ */
+#define MEMORY_CRITICAL_THRESHOLD 90
+
+/**
+ * Temperature warning threshold (Celsius)
+ */
+#define WARNING_TEMP_C 75.0
+
+/**
+ * Temperature critical threshold (Celsius)
+ */
+#define CRITICAL_TEMP_C 85.0
+
+/**
+ * Maximum number of devices to enumerate
+ */
+#define MAX_DEVICE_INDEX 32
+
+/**
+ * Maximum graphs per device (memory-limited, typically ~10)
+ */
+#define TYPICAL_MAX_GRAPHS 10
+
+/**
+ * Maximum FIFOs per device
+ */
+#define TYPICAL_MAX_FIFOS 20
+
 typedef struct ncDeviceHandle_t {
   uint8_t _private[0];
 } ncDeviceHandle_t;
