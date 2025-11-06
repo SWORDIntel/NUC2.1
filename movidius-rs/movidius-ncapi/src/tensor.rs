@@ -44,14 +44,37 @@ impl Default for TensorDescriptor {
 }
 
 impl TensorDescriptor {
-    /// Create a new tensor descriptor
+    /// Create a new tensor descriptor with overflow checking
     #[inline]
-    pub const fn new(n: u32, c: u32, h: u32, w: u32, data_type: FifoDataType) -> Self {
+    pub fn new(n: u32, c: u32, h: u32, w: u32, data_type: FifoDataType) -> Self {
+        // Safety checks for overflow
+        debug_assert!(n > 0, "Batch size must be > 0");
+        debug_assert!(c > 0, "Channels must be > 0");
+        debug_assert!(h > 0, "Height must be > 0");
+        debug_assert!(w > 0, "Width must be > 0");
+
         let elem_size = data_type.size_bytes();
         let w_stride = elem_size;
-        let h_stride = w * w_stride;
-        let c_stride = h * h_stride;
-        let total_size = n * c * h * w * elem_size;
+
+        // Check for overflow in stride calculations
+        let h_stride = match w.checked_mul(w_stride) {
+            Some(v) => v,
+            None => panic!("Overflow in h_stride calculation"),
+        };
+
+        let c_stride = match h.checked_mul(h_stride) {
+            Some(v) => v,
+            None => panic!("Overflow in c_stride calculation"),
+        };
+
+        // Check for overflow in total size calculation
+        let total_size = match n.checked_mul(c)
+            .and_then(|v| v.checked_mul(h))
+            .and_then(|v| v.checked_mul(w))
+            .and_then(|v| v.checked_mul(elem_size)) {
+            Some(v) => v,
+            None => panic!("Overflow in total_size calculation"),
+        };
 
         Self {
             n,
@@ -69,13 +92,13 @@ impl TensorDescriptor {
 
     /// Create for an image tensor
     #[inline]
-    pub const fn image(height: u32, width: u32, channels: u32, data_type: FifoDataType) -> Self {
+    pub fn image(height: u32, width: u32, channels: u32, data_type: FifoDataType) -> Self {
         Self::new(1, channels, height, width, data_type)
     }
 
     /// Create for a 1D vector
     #[inline]
-    pub const fn vector(length: u32, data_type: FifoDataType) -> Self {
+    pub fn vector(length: u32, data_type: FifoDataType) -> Self {
         Self::new(1, 1, 1, length, data_type)
     }
 
