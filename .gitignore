@@ -82,3 +82,8 @@ venv/
 *.pdf
 *.html
 docs/_build/
+
+# Rust build artifacts
+movidius-rs/target/
+**/*.rs.bk
+Cargo.lock
