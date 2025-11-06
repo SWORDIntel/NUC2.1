@@ -1,0 +1,14 @@
+/home/user/NUC2.1/movidius-rs/target/debug/deps/io_uring-1c682e5e20afe3e7.d: /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/util.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/cqueue.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/opcode.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/register.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/squeue.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/mod.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/types.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/sys.rs
+
+/home/user/NUC2.1/movidius-rs/target/debug/deps/libio_uring-1c682e5e20afe3e7.rmeta: /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/util.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/cqueue.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/opcode.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/register.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/squeue.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/mod.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/types.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/sys.rs
+
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/util.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/cqueue.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/opcode.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/register.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/squeue.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/mod.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/types.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/sys.rs:

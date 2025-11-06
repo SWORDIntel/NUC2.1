@@ -1,0 +1,1 @@
+{"rustc":16285725380928457773,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[17842230955905556558,"build_script_build",false,1188434234401084218]],"local":[{"RerunIfChanged":{"output":"debug/build/movidius-ncapi-c3d29d40e65638bc/output","paths":["src/"]}}],"rustflags":[],"config":0,"compile_kind":0}
