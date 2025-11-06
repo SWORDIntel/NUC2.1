@@ -1,6 +1,5 @@
 //! High-performance lock-free FIFO queue implementation
 
-use crate::conversion::{fp16_to_fp32, fp32_to_fp16};
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::status::Status;
@@ -10,30 +9,37 @@ use crossbeam::queue::ArrayQueue;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-/// FIFO data types
+/// FIFO data types (Pod-safe wrapper)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
-#[repr(i32)]
-pub enum FifoDataType {
-    /// 16-bit floating point
-    Fp16 = 0,
-    /// 32-bit floating point (default)
-    Fp32 = 1,
-}
+#[repr(transparent)]
+pub struct FifoDataType(i32);
 
 impl FifoDataType {
+    /// 16-bit floating point
+    pub const FP16: Self = Self(0);
+    /// 32-bit floating point (default)
+    pub const FP32: Self = Self(1);
+
     /// Size in bytes
     #[inline]
     pub const fn size_bytes(self) -> u32 {
-        match self {
-            Self::Fp16 => 2,
-            Self::Fp32 => 4,
+        match self.0 {
+            0 => 2, // FP16
+            1 => 4, // FP32
+            _ => 4,
         }
+    }
+
+    /// Get the inner i32 value
+    #[inline]
+    pub const fn as_i32(self) -> i32 {
+        self.0
     }
 }
 
 impl Default for FifoDataType {
     fn default() -> Self {
-        Self::Fp32
+        Self::FP32
     }
 }
 
@@ -128,8 +134,41 @@ impl Fifo {
         num_elem: usize,
     ) -> Result<()> {
         if self.state != FifoState::Created {
+            tracing::error!(
+                "Cannot allocate FIFO '{}' in state {:?}, must be Created",
+                self.name,
+                self.state
+            );
             return Err(Error::Status(Status::InvalidHandle));
         }
+
+        // Validate num_elem
+        if num_elem == 0 {
+            tracing::error!("FIFO '{}': num_elem must be > 0", self.name);
+            return Err(Error::Status(Status::InvalidParameters));
+        }
+        if num_elem > 1000000 {
+            // Reasonable upper bound
+            tracing::error!(
+                "FIFO '{}': num_elem {} exceeds maximum of 1000000",
+                self.name,
+                num_elem
+            );
+            return Err(Error::Status(Status::InvalidParameters));
+        }
+
+        // Validate tensor descriptor
+        if !tensor_desc.is_contiguous() {
+            tracing::error!("FIFO '{}': tensor descriptor must be contiguous", self.name);
+            return Err(Error::Status(Status::InvalidParameters));
+        }
+
+        tracing::debug!(
+            "Allocating FIFO '{}' with {} elements of {} bytes each",
+            self.name,
+            num_elem,
+            tensor_desc.total_size
+        );
 
         self.device = Some(device);
         self.tensor_desc = *tensor_desc;
@@ -137,6 +176,7 @@ impl Fifo {
         self.queue = Arc::new(ArrayQueue::new(num_elem));
         self.state = FifoState::Allocated;
 
+        tracing::info!("FIFO '{}' allocated successfully", self.name);
         Ok(())
     }
 
@@ -144,18 +184,28 @@ impl Fifo {
     #[inline]
     pub fn write_elem(&self, input_tensor: &[u8], user_param: Option<usize>) -> Result<()> {
         if self.state != FifoState::Allocated {
+            tracing::error!("FIFO '{}' not allocated for write", self.name);
             return Err(Error::Status(Status::NotAllocated));
         }
 
         if self.fifo_type != FifoType::HostWo {
+            tracing::error!("FIFO '{}' is not write-only (type: {:?})", self.name, self.fifo_type);
             return Err(Error::Status(Status::Unauthorized));
         }
 
         // Validate size
         let expected_size = self.tensor_desc.total_size as usize;
         if input_tensor.len() != expected_size {
+            tracing::error!(
+                "FIFO '{}': invalid tensor size {} (expected {})",
+                self.name,
+                input_tensor.len(),
+                expected_size
+            );
             return Err(Error::Status(Status::InvalidDataLength));
         }
+
+        tracing::trace!("Writing {} bytes to FIFO '{}'", input_tensor.len(), self.name);
 
         // Convert data type if needed
         let data = self.convert_to_device_format(input_tensor)?;
@@ -183,12 +233,16 @@ impl Fifo {
     #[inline]
     pub fn read_elem(&self) -> Result<(Vec<u8>, Option<usize>)> {
         if self.state != FifoState::Allocated {
+            tracing::error!("FIFO '{}' not allocated for read", self.name);
             return Err(Error::Status(Status::NotAllocated));
         }
 
         if self.fifo_type != FifoType::HostRo {
+            tracing::error!("FIFO '{}' is not read-only (type: {:?})", self.name, self.fifo_type);
             return Err(Error::Status(Status::Unauthorized));
         }
+
+        tracing::trace!("Reading from FIFO '{}'", self.name);
 
         // Lock-free pop
         let element = if let Some(elem) = self.queue.pop() {
@@ -215,7 +269,7 @@ impl Fifo {
     pub fn get_option(&self, option: FifoOption) -> Result<Vec<u8>> {
         match option {
             FifoOption::Type => Ok((self.fifo_type as i32).to_le_bytes().to_vec()),
-            FifoOption::DataType => Ok((self.data_type as i32).to_le_bytes().to_vec()),
+            FifoOption::DataType => Ok(self.data_type.as_i32().to_le_bytes().to_vec()),
             FifoOption::DontBlock => Ok((self.dont_block as i32).to_le_bytes().to_vec()),
             FifoOption::Capacity => Ok((self.capacity as i32).to_le_bytes().to_vec()),
             FifoOption::ReadFillLevel | FifoOption::WriteFillLevel => {
@@ -251,8 +305,8 @@ impl Fifo {
                     Error::Status(Status::InvalidParameters)
                 })?);
                 self.data_type = match val {
-                    0 => FifoDataType::Fp16,
-                    1 => FifoDataType::Fp32,
+                    0 => FifoDataType::FP16,
+                    1 => FifoDataType::FP32,
                     _ => return Err(Error::Status(Status::InvalidParameters)),
                 };
             }
@@ -277,8 +331,8 @@ impl Fifo {
         }
 
         // Convert FP32 host -> FP16 device
-        if self.tensor_desc.data_type == FifoDataType::Fp32 
-            && self.data_type == FifoDataType::Fp16 
+        if self.tensor_desc.data_type == FifoDataType::FP32
+            && self.data_type == FifoDataType::FP16 
         {
             let fp32_slice = bytemuck::cast_slice::<u8, f32>(data);
             let fp16_vec = crate::conversion::fp32_to_fp16_vec(fp32_slice);
@@ -298,8 +352,8 @@ impl Fifo {
         }
 
         // Convert FP16 device -> FP32 host
-        if self.tensor_desc.data_type == FifoDataType::Fp16 
-            && self.data_type == FifoDataType::Fp32 
+        if self.tensor_desc.data_type == FifoDataType::FP16
+            && self.data_type == FifoDataType::FP32 
         {
             let fp16_slice = bytemuck::cast_slice::<u8, half::f16>(data);
             let fp32_vec = crate::conversion::fp16_to_fp32_vec(fp16_slice);

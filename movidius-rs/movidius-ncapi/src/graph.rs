@@ -2,7 +2,7 @@
 
 use crate::device::Device;
 use crate::error::{Error, Result};
-use crate::fifo::{Fifo, FifoDataType, FifoType};
+use crate::fifo::{Fifo, FifoType};
 use crate::status::Status;
 use crate::tensor::TensorDescriptor;
 use parking_lot::RwLock;
@@ -38,11 +38,26 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// Minimum valid graph file size
+    const MIN_GRAPH_SIZE: usize = 64;
+    /// Maximum reasonable graph file size (100MB)
+    const MAX_GRAPH_SIZE: usize = 100 * 1024 * 1024;
+
     pub fn create(name: &str) -> Result<Self> {
+        if name.is_empty() {
+            tracing::error!("Graph name cannot be empty");
+            return Err(Error::Status(Status::InvalidParameters));
+        }
         if name.len() >= crate::MAX_NAME_SIZE {
+            tracing::error!(
+                "Graph name '{}' exceeds maximum length of {}",
+                name,
+                crate::MAX_NAME_SIZE
+            );
             return Err(Error::Status(Status::InvalidParameters));
         }
 
+        tracing::debug!("Creating graph '{}'", name);
         Ok(Self {
             name: name.to_string(),
             state: GraphState::Created,
@@ -58,15 +73,48 @@ impl Graph {
         graph_buffer: &[u8],
     ) -> Result<()> {
         if self.state != GraphState::Created {
+            tracing::error!(
+                "Cannot allocate graph '{}' in state {:?}, must be Created",
+                self.name,
+                self.state
+            );
             return Err(Error::Status(Status::InvalidHandle));
         }
 
+        // Validate graph buffer
+        if graph_buffer.len() < Self::MIN_GRAPH_SIZE {
+            tracing::error!(
+                "Graph '{}': buffer size {} is too small (minimum {})",
+                self.name,
+                graph_buffer.len(),
+                Self::MIN_GRAPH_SIZE
+            );
+            return Err(Error::Status(Status::InvalidParameters));
+        }
+        if graph_buffer.len() > Self::MAX_GRAPH_SIZE {
+            tracing::error!(
+                "Graph '{}': buffer size {} exceeds maximum of {}",
+                self.name,
+                graph_buffer.len(),
+                Self::MAX_GRAPH_SIZE
+            );
+            return Err(Error::Status(Status::InvalidParameters));
+        }
+
+        tracing::debug!(
+            "Allocating graph '{}' with {} byte buffer",
+            self.name,
+            graph_buffer.len()
+        );
+
         // Parse graph file (stub for now)
+        // TODO: Actual graph parsing and validation
         self.input_descriptors = vec![TensorDescriptor::default()];
         self.output_descriptors = vec![TensorDescriptor::default()];
 
         self.device = Some(device);
         self.state = GraphState::Allocated;
+        tracing::info!("Graph '{}' allocated successfully", self.name);
         Ok(())
     }
 

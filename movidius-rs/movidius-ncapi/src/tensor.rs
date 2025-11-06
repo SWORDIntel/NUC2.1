@@ -3,13 +3,12 @@
 use crate::fifo::FifoDataType;
 use bytemuck::{Pod, Zeroable};
 use cache_padded::CachePadded;
-use zerocopy::{AsBytes, FromBytes};
 
 /// Tensor descriptor describing shape and layout
 ///
 /// This structure is cache-aligned and designed for zero-copy operations.
 /// It's compatible with NCAPI v2's ncTensorDescriptor_t.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable, AsBytes, FromBytes)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C, align(64))]  // Cache-line aligned for performance
 pub struct TensorDescriptor {
     /// Batch count (currently always 1)
@@ -30,8 +29,8 @@ pub struct TensorDescriptor {
     pub h_stride: u32,
     /// Data type
     pub data_type: FifoDataType,
-    /// Padding to cache line
-    _padding: [u8; 27],
+    /// Padding to cache line (64 bytes total)
+    _padding: [u8; 28],
 }
 
 unsafe impl Send for TensorDescriptor {}
@@ -40,7 +39,7 @@ unsafe impl Sync for TensorDescriptor {}
 impl Default for TensorDescriptor {
     #[inline]
     fn default() -> Self {
-        Self::new(1, 1, 1, 1, FifoDataType::Fp32)
+        Self::new(1, 1, 1, 1, FifoDataType::FP32)
     }
 }
 
@@ -64,7 +63,7 @@ impl TensorDescriptor {
             w_stride,
             h_stride,
             data_type,
-            _padding: [0; 27],
+            _padding: [0; 28],
         }
     }
 
@@ -124,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_tensor_descriptor_image() {
-        let desc = TensorDescriptor::image(224, 224, 3, FifoDataType::Fp32);
+        let desc = TensorDescriptor::image(224, 224, 3, FifoDataType::FP32);
         assert_eq!(desc.n, 1);
         assert_eq!(desc.c, 3);
         assert_eq!(desc.h, 224);
@@ -136,14 +135,14 @@ mod tests {
 
     #[test]
     fn test_tensor_descriptor_vector() {
-        let desc = TensorDescriptor::vector(1000, FifoDataType::Fp16);
+        let desc = TensorDescriptor::vector(1000, FifoDataType::FP16);
         assert_eq!(desc.element_count(), 1000);
         assert_eq!(desc.total_size, 1000 * 2);
     }
 
     #[test]
     fn test_validate_buffer() {
-        let desc = TensorDescriptor::vector(100, FifoDataType::Fp32);
+        let desc = TensorDescriptor::vector(100, FifoDataType::FP32);
         assert!(desc.validate_buffer_size(400));
         assert!(!desc.validate_buffer_size(399));
         assert!(!desc.validate_buffer_size(401));
