@@ -11,7 +11,7 @@
 Module.symvers
 modules.order
 movidius-rs/target/
-movidius-rs/Cargo.lock
+# NOTE: Cargo.lock should NOT be ignored - needed for reproducible builds
 
 # Documentation
 *.md

@@ -37,9 +37,9 @@ RUN apt-get update && apt-get install -y \
 # Copy Rust workspace
 WORKDIR /build/rust
 COPY movidius-rs/Cargo.toml movidius-rs/Cargo.lock ./
-COPY movidius-rs/movidius-ncapi movidius-rs/movidius-ncapi/
-COPY movidius-rs/movidius-hal movidius-rs/movidius-hal/
-COPY movidius-rs/movidius-bench movidius-rs/movidius-bench/
+COPY movidius-rs/movidius-ncapi ./movidius-ncapi/
+COPY movidius-rs/movidius-hal ./movidius-hal/
+COPY movidius-rs/movidius-bench ./movidius-bench/
 
 # Build Rust components in release mode with optimizations
 RUN cargo build --release

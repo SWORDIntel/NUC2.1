@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
-            linux-headers-generic \
+            linux-headers-$(uname -r) \
             kmod \
             libelf-dev \
             bc \
@@ -34,8 +34,14 @@ jobs:
             bison \
             libssl-dev
 
+          # Verify kernel headers are installed correctly
+          ls -la /lib/modules/$(uname -r)/build || echo "Warning: Kernel headers path not found"
+
       - name: Build kernel modules
-        run: make clean && make
+        run: |
+          echo "Building with kernel: $(uname -r)"
+          echo "Kernel headers: /lib/modules/$(uname -r)/build"
+          make clean && make
 
       - name: Verify kernel modules
         run: |
@@ -160,15 +166,15 @@ jobs:
           context: .
           push: false
           load: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: movidius-test:latest
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Test Docker image
         run: |
-          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} ls -la /opt/movidius
+          docker run --rm movidius-test:latest
+          docker run --rm movidius-test:latest ls -la /opt/movidius
 
       - name: Push Docker image
         if: github.event_name != 'pull_request'
