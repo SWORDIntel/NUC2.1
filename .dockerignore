@@ -1,0 +1,31 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+*.o
+*.ko
+*.mod*
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+movidius-rs/target/
+movidius-rs/Cargo.lock
+
+# Documentation
+*.md
+docs/
+THEORETICAL_IMPROVEMENTS.md
+KERNEL_INTEGRATION.md
+NCAPI_V2_ANALYSIS.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Misc
+.DS_Store
