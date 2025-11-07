@@ -1098,7 +1098,7 @@ static ssize_t compute_utilization_show(struct kobject *kobj, struct kobj_attrib
 
 static ssize_t memory_bandwidth_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, *sysfs_kobj);
+    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, sysfs_kobj);
     u64 bw = atomic64_read(&dev->hw_counters.memory_bandwidth);
     return sprintf(buf, "%lld.%02lld\n", bw / 100, bw % 100);
 }
@@ -1492,7 +1492,12 @@ static int __init movidius_x_vpu_init(void)
         return ret;
     }
 
+    /* class_create API changed in kernel 6.4+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
     movidius_class = class_create(DRIVER_NAME);
+#else
+    movidius_class = class_create(THIS_MODULE, DRIVER_NAME);
+#endif
     if (IS_ERR(movidius_class)) {
         ret = PTR_ERR(movidius_class);
         unregister_chrdev_region(movidius_devt, MAX_DEVICES);
