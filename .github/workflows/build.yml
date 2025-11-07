@@ -48,8 +48,11 @@ jobs:
           apt-get install -y linux-headers-generic || apt-get install -y linux-headers-amd64 || true
 
           # Find arch-specific kernel headers (NOT -common, that's just shared files)
-          # Look for directories like linux-headers-*-amd64 or linux-headers-*-generic
-          HEADERS_DIR=$(find /usr/src -maxdepth 1 -type d \( -name "linux-headers-*-amd64" -o -name "linux-headers-*-generic" \) 2>/dev/null | head -n1)
+          # Explicitly exclude -common directories which only contain shared headers
+          echo "Searching for arch-specific kernel headers..."
+          ls -1d /usr/src/linux-headers-* 2>/dev/null || true
+
+          HEADERS_DIR=$(ls -1d /usr/src/linux-headers-* 2>/dev/null | grep -v '\-common$' | head -n1)
 
           if [ -z "$HEADERS_DIR" ]; then
             echo "ERROR: No arch-specific kernel headers found"
@@ -58,7 +61,7 @@ jobs:
             exit 1
           fi
 
-          echo "Using kernel headers from: ${HEADERS_DIR}"
+          echo "✓ Using kernel headers from: ${HEADERS_DIR}"
 
           # Prepare kernel headers if needed (creates include/config/auto.conf)
           cd "${HEADERS_DIR}"
