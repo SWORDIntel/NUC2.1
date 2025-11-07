@@ -9,7 +9,7 @@ use cache_padded::CachePadded;
 /// This structure is cache-aligned and designed for zero-copy operations.
 /// It's compatible with NCAPI v2's ncTensorDescriptor_t.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
-#[repr(C, align(64))]  // Cache-line aligned for performance
+#[repr(C, align(64))] // Cache-line aligned for performance
 pub struct TensorDescriptor {
     /// Batch count (currently always 1)
     pub n: u32,
@@ -68,10 +68,12 @@ impl TensorDescriptor {
         };
 
         // Check for overflow in total size calculation
-        let total_size = match n.checked_mul(c)
+        let total_size = match n
+            .checked_mul(c)
             .and_then(|v| v.checked_mul(h))
             .and_then(|v| v.checked_mul(w))
-            .and_then(|v| v.checked_mul(elem_size)) {
+            .and_then(|v| v.checked_mul(elem_size))
+        {
             Some(v) => v,
             None => panic!("Overflow in total_size calculation"),
         };

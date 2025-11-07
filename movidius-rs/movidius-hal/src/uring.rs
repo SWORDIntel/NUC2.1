@@ -18,19 +18,13 @@ impl UringSubmitter {
 
     /// Submit inference request (placeholder - actual implementation would use proper ops)
     #[inline]
-    pub fn submit_inference(
-        &mut self,
-        fd: RawFd,
-        _cmd_op: u32,
-        user_data: u64,
-    ) -> Result<()> {
+    pub fn submit_inference(&mut self, fd: RawFd, _cmd_op: u32, user_data: u64) -> Result<()> {
         // Use NOP for now as UringCmd is not in this version
-        let entry = opcode::Nop::new()
-            .build()
-            .user_data(user_data);
+        let entry = opcode::Nop::new().build().user_data(user_data);
 
         unsafe {
-            self.ring.submission()
+            self.ring
+                .submission()
                 .push(&entry)
                 .map_err(|_| Error::Uring("Queue full".to_string()))?;
         }
@@ -52,7 +46,10 @@ impl UringSubmitter {
     /// Wait for completion (blocking)
     #[inline]
     pub fn wait_completion(&mut self) -> Result<(u64, i32)> {
-        let cqe = self.ring.completion().next()
+        let cqe = self
+            .ring
+            .completion()
+            .next()
             .ok_or_else(|| Error::Uring("No completion".to_string()))?;
         Ok((cqe.user_data(), cqe.result()))
     }

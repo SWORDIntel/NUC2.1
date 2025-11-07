@@ -128,9 +128,9 @@ impl Device {
     /// Get thermal statistics (temperature in Celsius)
     /// Returns (current_temp, max_temp)
     pub fn thermal_stats(&self) -> Result<(f32, f32)> {
-        let fd = self.fd.ok_or_else(|| {
-            Error::InvalidState("Device not opened".to_string())
-        })?;
+        let fd = self
+            .fd
+            .ok_or_else(|| Error::InvalidState("Device not opened".to_string()))?;
 
         let thermal_info = movidius_hal::IoctlInterface::get_thermal(fd)
             .map_err(|e| Error::Hardware(format!("Failed to get thermal stats: {}", e)))?;
@@ -148,9 +148,9 @@ impl Device {
 
     /// Get current thermal throttling level
     pub fn throttling_level(&self) -> Result<crate::config::thermal::ThrottleLevel> {
-        let fd = self.fd.ok_or_else(|| {
-            Error::InvalidState("Device not opened".to_string())
-        })?;
+        let fd = self
+            .fd
+            .ok_or_else(|| Error::InvalidState("Device not opened".to_string()))?;
 
         let thermal_info = movidius_hal::IoctlInterface::get_thermal(fd)
             .map_err(|e| Error::Hardware(format!("Failed to get throttling level: {}", e)))?;
@@ -169,9 +169,9 @@ impl Device {
     /// Get current memory usage statistics
     /// Returns (used_bytes, total_bytes)
     pub fn memory_usage(&self) -> Result<(u64, u64)> {
-        let fd = self.fd.ok_or_else(|| {
-            Error::InvalidState("Device not opened".to_string())
-        })?;
+        let fd = self
+            .fd
+            .ok_or_else(|| Error::InvalidState("Device not opened".to_string()))?;
 
         let mem_info = movidius_hal::IoctlInterface::get_memory_usage(fd)
             .map_err(|e| Error::Hardware(format!("Failed to get memory usage: {}", e)))?;
@@ -190,9 +190,9 @@ impl Device {
     /// Get resource allocation counts
     /// Returns (allocated_graphs, max_graphs, allocated_fifos, max_fifos)
     pub fn resource_counts(&self) -> Result<(u32, u32, u32, u32)> {
-        let fd = self.fd.ok_or_else(|| {
-            Error::InvalidState("Device not opened".to_string())
-        })?;
+        let fd = self
+            .fd
+            .ok_or_else(|| Error::InvalidState("Device not opened".to_string()))?;
 
         let res_info = movidius_hal::IoctlInterface::get_resources(fd)
             .map_err(|e| Error::Hardware(format!("Failed to get resource counts: {}", e)))?;
@@ -265,8 +265,7 @@ impl Device {
         let (temp, _max_temp) = self.thermal_stats()?;
         let throttling = self.throttling_level()?;
         let (memory_used, memory_total) = self.memory_usage()?;
-        let (graphs_allocated, graphs_max, fifos_allocated, fifos_max) =
-            self.resource_counts()?;
+        let (graphs_allocated, graphs_max, fifos_allocated, fifos_max) = self.resource_counts()?;
 
         let memory_percent = ((memory_used * 100) / memory_total) as u8;
 

@@ -59,7 +59,7 @@ impl PipelineMetrics {
         // VPU should never wait for input in optimal pipeline
         self.receive_tensor_time < crate::config::performance::MAX_RECEIVE_TENSOR_TIME
             && self.input_queue_depth > 0  // Always has work queued
-            && self.output_queue_depth < crate::config::fifo::MAX_DEPTH - 1  // Not backing up
+            && self.output_queue_depth < crate::config::fifo::MAX_DEPTH - 1 // Not backing up
     }
 
     /// Detect pipeline bottleneck
@@ -107,9 +107,7 @@ impl PipelineMetrics {
     pub fn recommendation(&self) -> &'static str {
         match self.bottleneck() {
             Bottleneck::None => "Pipeline is optimal",
-            Bottleneck::InputStarved => {
-                "Increase FIFO depth or add more producer threads"
-            }
+            Bottleneck::InputStarved => "Increase FIFO depth or add more producer threads",
             Bottleneck::OutputStalled => {
                 "Speed up consumer threads or increase output processing rate"
             }

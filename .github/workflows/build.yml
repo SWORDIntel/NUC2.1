@@ -31,9 +31,10 @@ jobs:
       - name: Install kernel build dependencies
         run: |
           apt-get update
+
+          # Install build tools first
           apt-get install -y \
             build-essential \
-            linux-headers-$(uname -r) \
             kmod \
             libelf-dev \
             bc \
@@ -42,9 +43,30 @@ jobs:
             libssl-dev \
             git
 
-          # Verify kernel headers are installed correctly
-          echo "Kernel version: $(uname -r)"
-          ls -la /lib/modules/$(uname -r)/build || echo "Warning: Kernel headers path not found"
+          # Install generic kernel headers (GitHub Actions uses Azure kernels not in repos)
+          # We're cross-compiling, not loading modules, so generic headers are fine
+          apt-get install -y linux-headers-generic || true
+
+          # Find available kernel headers
+          HEADERS_DIR=$(find /usr/src -maxdepth 1 -name "linux-headers-*" -type d 2>/dev/null | head -n1)
+
+          if [ -z "$HEADERS_DIR" ]; then
+            echo "ERROR: No kernel headers found"
+            exit 1
+          fi
+
+          echo "Using kernel headers from: ${HEADERS_DIR}"
+
+          # Create symlink for current kernel if needed
+          KERNEL_VERSION=$(uname -r)
+          if [ ! -d "/lib/modules/${KERNEL_VERSION}/build" ]; then
+            mkdir -p "/lib/modules/${KERNEL_VERSION}"
+            ln -sf "${HEADERS_DIR}" "/lib/modules/${KERNEL_VERSION}/build"
+          fi
+
+          echo "Build kernel: $(uname -r)"
+          echo "Headers path: /lib/modules/$(uname -r)/build -> ${HEADERS_DIR}"
+          ls -la /lib/modules/$(uname -r)/build
 
       - name: Build kernel modules
         run: |

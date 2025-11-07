@@ -44,9 +44,11 @@ pub fn global_set_option(option: GlobalOption, value: &[u8]) -> Result<()> {
     let mut state = global_state().write();
     match option {
         GlobalOption::LogLevel => {
-            let val = i32::from_le_bytes(value.try_into().map_err(|_| {
-                crate::Error::Status(Status::InvalidParameters)
-            })?);
+            let val = i32::from_le_bytes(
+                value
+                    .try_into()
+                    .map_err(|_| crate::Error::Status(Status::InvalidParameters))?,
+            );
             state.log_level = match val {
                 0 => LogLevel::Fatal,
                 1 => LogLevel::Error,
@@ -57,8 +59,6 @@ pub fn global_set_option(option: GlobalOption, value: &[u8]) -> Result<()> {
             };
             Ok(())
         }
-        GlobalOption::ApiVersion => {
-            Err(crate::Error::Status(Status::Unauthorized))
-        }
+        GlobalOption::ApiVersion => Err(crate::Error::Status(Status::Unauthorized)),
     }
 }

@@ -118,10 +118,7 @@ impl IoctlInterface {
 
     /// Get memory usage
     pub fn get_memory_usage(fd: RawFd) -> Result<MemoryUsage> {
-        let mut info = MemoryUsage {
-            total: 0,
-            used: 0,
-        };
+        let mut info = MemoryUsage { total: 0, used: 0 };
 
         unsafe {
             let ret = libc::ioctl(fd, MOVIDIUS_IOCTL_GET_MEMORY_USAGE, &mut info);
@@ -154,9 +151,9 @@ impl IoctlInterface {
                 tracing::warn!("IOCTL GET_RESOURCES not supported, using defaults");
                 return Ok(ResourceInfo {
                     graphs_allocated: 0,
-                    graphs_max: 8,  // Typical limit
+                    graphs_max: 8, // Typical limit
                     fifos_allocated: 0,
-                    fifos_max: 16,  // Typical limit
+                    fifos_max: 16, // Typical limit
                 });
             }
         }
