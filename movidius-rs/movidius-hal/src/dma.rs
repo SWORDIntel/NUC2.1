@@ -1,20 +1,20 @@
 //! Zero-copy DMA arena management
 
-use super::{Error, Result};
+use super::Result;
 use std::ptr;
 
 /// DMA arena for zero-copy transfers
 pub struct DmaArena {
     user_addr: u64,
     len: u64,
-    pages: Vec<*mut libc::c_void>,
+    _pages: Vec<*mut libc::c_void>,
 }
 
 impl DmaArena {
     /// Register a DMA arena
     pub fn register(addr: u64, len: u64) -> Result<Self> {
         // Pin user pages for DMA
-        let page_count = (len + 4095) / 4096;
+        let page_count = len.div_ceil(4096);
         let mut pages = Vec::with_capacity(page_count as usize);
 
         // In real implementation, this would pin pages via kernel driver
@@ -26,7 +26,7 @@ impl DmaArena {
         Ok(Self {
             user_addr: addr,
             len,
-            pages,
+            _pages: pages,
         })
     }
 
