@@ -1,0 +1,71 @@
+[package]
+name = "movidius-ncapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "High-performance Rust implementation of Movidius NCAPI v2"
+
+[lib]
+name = "movidius_ncapi"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+# Workspace dependencies
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, optional = true }
+crossbeam = { workspace = true }
+parking_lot = { workspace = true }
+half = { workspace = true }
+bytemuck = { workspace = true }
+zerocopy = { workspace = true }
+memmap2 = { workspace = true }
+bincode = { workspace = true }
+libc = { workspace = true }
+nix = { workspace = true }
+tracing = { workspace = true }
+
+# Project-specific
+movidius-hal = { path = "../movidius-hal" }
+
+# Atomic operations
+atomic = "0.6"
+crossbeam-utils = "0.8"
+
+# Cache-aligned types
+cache-padded = "1.3"
+
+# NUMA awareness
+hwloc2 = { version = "2.0", optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+pprof = { workspace = true }
+tempfile = "3.8"
+proptest = "1.4"
+
+[features]
+default = ["async"]
+async = ["tokio"]
+numa = ["hwloc2"]
+# Enable CPU-specific SIMD (use with caution)
+simd-nightly = []
+
+[build-dependencies]
+cbindgen = { workspace = true }
+
+[[bench]]
+name = "tensor_ops"
+harness = false
+
+[[bench]]
+name = "conversion"
+harness = false
+
+[[bench]]
+name = "fifo"
+harness = false

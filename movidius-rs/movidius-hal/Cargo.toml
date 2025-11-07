@@ -1,0 +1,31 @@
+[package]
+name = "movidius-hal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Hardware abstraction layer for Movidius VPU"
+
+[dependencies]
+# Workspace dependencies
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+io-uring = { workspace = true }
+crossbeam = { workspace = true }
+parking_lot = { workspace = true }
+bytemuck = { workspace = true }
+zerocopy = { workspace = true }
+libc = { workspace = true }
+nix = { workspace = true }
+tracing = { workspace = true }
+
+# Cache-aligned types
+cache-padded = { workspace = true }
+
+# Memory management
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = "3.8"
