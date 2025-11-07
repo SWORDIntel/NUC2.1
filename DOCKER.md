@@ -2,10 +2,13 @@
 
 Docker-based compilation environment for Movidius NUC2.1 project. Builds both kernel driver and Rust components in isolated containers.
 
+Supports both **Ubuntu 22.04** and **Debian Bookworm (12)** with kernel 6.1.x/6.17+ support.
+
 ## Quick Start
 
 ### Using Docker Compose (Recommended)
 
+**Ubuntu Build:**
 ```bash
 # Build and extract artifacts
 docker-compose up builder
@@ -15,8 +18,19 @@ ls -la artifacts/kernel/*.ko
 ls -la artifacts/bin/movidius-bench
 ```
 
+**Debian Build (6.1.x/6.17+ kernel):**
+```bash
+# Build with Debian Bookworm base
+docker-compose up builder-debian
+
+# Artifacts will be in ./artifacts-debian/
+ls -la artifacts-debian/kernel/*.ko
+ls -la artifacts-debian/bin/movidius-bench
+```
+
 ### Using Docker Directly
 
+**Ubuntu Build:**
 ```bash
 # Build image
 docker build -t movidius-nuc21:latest .
@@ -29,23 +43,36 @@ docker run --rm -v $(pwd)/artifacts:/out movidius-nuc21:latest \
   sh -c "cp -r /opt/movidius/* /out/"
 ```
 
+**Debian Build:**
+```bash
+# Build Debian image
+docker build -f Dockerfile.debian -t movidius-nuc21:debian .
+
+# Run and view build info
+docker run --rm movidius-nuc21:debian
+
+# Extract artifacts
+docker run --rm -v $(pwd)/artifacts-debian:/out movidius-nuc21:debian \
+  sh -c "cp -r /opt/movidius/* /out/"
+```
+
 ## Multi-Stage Build
 
-The Dockerfile uses a 3-stage build:
+Both Dockerfiles (`Dockerfile` for Ubuntu, `Dockerfile.debian` for Debian) use a 3-stage build:
 
 ### Stage 1: Kernel Builder
-- Base: `ubuntu:22.04`
-- Installs kernel headers and build tools
+- Base: `ubuntu:22.04` or `debian:bookworm`
+- Installs kernel headers and build tools for the running kernel
 - Compiles `movidius_x_vpu.ko` and `vfio_movidius.ko`
 
 ### Stage 2: Rust Builder
-- Base: `rust:1.75-slim`
+- Base: `rust:1.75-slim` or `rust:1.75-slim-bookworm`
 - Builds entire Rust workspace in release mode
 - Runs tests
 - Produces optimized binaries
 
 ### Stage 3: Final Image
-- Base: `ubuntu:22.04` (minimal)
+- Base: `ubuntu:22.04` or `debian:bookworm-slim` (minimal)
 - Contains only compiled artifacts:
   - `/opt/movidius/kernel/*.ko` - Kernel modules
   - `/opt/movidius/bin/movidius-bench` - Benchmark tool
