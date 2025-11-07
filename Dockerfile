@@ -33,7 +33,8 @@ RUN echo "Searching for kernel headers..." && \
         make oldconfig && \
         make modules_prepare; \
     fi && \
-    KERNEL_VERSION=$(uname -r) && \
+    KERNEL_VERSION=$(basename "$HEADERS_DIR" | sed 's/linux-headers-//') && \
+    echo "✓ Detected kernel version: $KERNEL_VERSION" && \
     mkdir -p /lib/modules/$KERNEL_VERSION && \
     ln -sf "$HEADERS_DIR" /lib/modules/$KERNEL_VERSION/build && \
     echo "✓ Headers prepared at: $HEADERS_DIR"
