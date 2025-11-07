@@ -1,0 +1,265 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ main, develop, 'claude/**' ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Job 1: Build kernel driver
+  build-kernel:
+    name: Build Kernel Driver
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            linux-headers-generic \
+            kmod \
+            libelf-dev \
+            bc \
+            flex \
+            bison \
+            libssl-dev
+
+      - name: Build kernel modules
+        run: make clean && make
+
+      - name: Verify kernel modules
+        run: |
+          test -f movidius_x_vpu.ko
+          test -f vfio_movidius.ko
+          ls -lh *.ko
+          modinfo movidius_x_vpu.ko
+
+      - name: Upload kernel modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-modules
+          path: |
+            movidius_x_vpu.ko
+            vfio_movidius.ko
+          retention-days: 30
+
+  # Job 2: Build and test Rust components
+  build-rust:
+    name: Build Rust Components
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        rust: [stable, beta, nightly]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          profile: minimal
+          override: true
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: movidius-rs/target
+          key: ${{ runner.os }}-cargo-build-target-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        if: matrix.rust == 'stable'
+        run: cd movidius-rs && cargo fmt --all -- --check
+
+      - name: Run clippy
+        if: matrix.rust == 'stable'
+        run: cd movidius-rs && cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build Rust workspace
+        run: cd movidius-rs && cargo build --release --verbose
+
+      - name: Run tests
+        run: cd movidius-rs && cargo test --release --verbose
+
+      - name: Build benchmark tool
+        run: cd movidius-rs && cargo build --release -p movidius-bench
+
+      - name: Upload Rust binaries (stable only)
+        if: matrix.rust == 'stable'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-binaries
+          path: |
+            movidius-rs/target/release/movidius-bench
+            movidius-rs/target/release/libmovidius_ncapi.*
+          retention-days: 30
+
+  # Job 3: Docker build and push
+  build-docker:
+    name: Build Docker Image
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test Docker image
+        run: |
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} ls -la /opt/movidius
+
+      - name: Push Docker image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Job 4: Integration test
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-22.04
+    needs: [build-kernel, build-rust]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download kernel modules
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-modules
+
+      - name: Download Rust binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-binaries
+          path: movidius-rs/target/release/
+
+      - name: Set permissions
+        run: |
+          chmod +x movidius-rs/target/release/movidius-bench
+          chmod +x movidius-rs/scripts/*.sh
+
+      - name: Verify artifacts
+        run: |
+          ls -lh *.ko
+          ls -lh movidius-rs/target/release/movidius-bench
+          file movidius-rs/target/release/movidius-bench
+
+      - name: Create artifact summary
+        run: |
+          echo "## Build Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Kernel Modules" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          ls -lh *.ko >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Rust Binaries" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          ls -lh movidius-rs/target/release/movidius-bench >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # Job 5: Benchmark (optional, only on main/develop)
+  benchmark:
+    name: Performance Benchmarks
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    needs: build-rust
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            movidius-rs/target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run benchmarks
+        run: cd movidius-rs && cargo bench --no-fail-fast
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: movidius-rs/target/criterion/
+          retention-days: 30

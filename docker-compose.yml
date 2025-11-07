@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  # Build service - compiles everything
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: final
+    image: movidius-nuc21:latest
+    container_name: movidius-builder
+    volumes:
+      # Mount output directory for easy artifact extraction
+      - ./artifacts:/artifacts:rw
+    command: >
+      sh -c "
+        echo 'Copying artifacts to /artifacts...';
+        mkdir -p /artifacts/kernel /artifacts/bin /artifacts/scripts;
+        cp /opt/movidius/kernel/*.ko /artifacts/kernel/;
+        cp /opt/movidius/bin/* /artifacts/bin/;
+        cp /opt/movidius/scripts/*.sh /artifacts/scripts/;
+        echo 'Artifacts copied successfully!';
+        ls -lah /artifacts/kernel/;
+        ls -lah /artifacts/bin/;
+        cat /opt/movidius/BUILD_INFO
+      "
+
+  # Development service - for interactive testing
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: rust-builder
+    image: movidius-nuc21:dev
+    container_name: movidius-dev
+    working_dir: /build/rust
+    volumes:
+      - ./movidius-rs:/build/rust:cached
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/build/rust/target
+    command: bash
+    stdin_open: true
+    tty: true
+
+volumes:
+  cargo-cache:
+  target-cache:
