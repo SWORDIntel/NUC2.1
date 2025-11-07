@@ -16,6 +16,28 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Prepare kernel headers for module builds
+# Use arch-specific headers (e.g., linux-headers-*-generic), NOT -common
+RUN echo "Searching for kernel headers..." && \
+    ls -1d /usr/src/linux-headers-* 2>/dev/null && \
+    HEADERS_DIR=$(ls -1d /usr/src/linux-headers-* 2>/dev/null | grep -v '\-common$' | head -n1) && \
+    if [ -z "$HEADERS_DIR" ]; then \
+        echo "ERROR: No arch-specific kernel headers found" && \
+        ls -la /usr/src && \
+        exit 1; \
+    fi && \
+    echo "✓ Using headers: $HEADERS_DIR" && \
+    cd "$HEADERS_DIR" && \
+    if [ ! -f "include/config/auto.conf" ]; then \
+        echo "Preparing kernel headers..." && \
+        make oldconfig && \
+        make modules_prepare; \
+    fi && \
+    KERNEL_VERSION=$(uname -r) && \
+    mkdir -p /lib/modules/$KERNEL_VERSION && \
+    ln -sf "$HEADERS_DIR" /lib/modules/$KERNEL_VERSION/build && \
+    echo "✓ Headers prepared at: $HEADERS_DIR"
+
 # Copy kernel driver source
 WORKDIR /build/kernel
 COPY movidius_x_vpu.c .
@@ -28,10 +50,11 @@ RUN make clean && make
 # Stage 2: Rust build environment
 FROM rust:1.75-slim AS rust-builder
 
-# Install system dependencies
+# Install system dependencies for Rust build
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    liburing-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Rust workspace

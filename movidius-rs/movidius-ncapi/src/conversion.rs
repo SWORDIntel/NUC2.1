@@ -18,16 +18,22 @@ use half::f16;
 /// Input and output slices must have equal length.
 #[inline]
 pub fn fp32_to_fp16(src: &[f32], dst: &mut [f16]) {
-    assert_eq!(src.len(), dst.len(), "Input and output slices must have equal length");
+    assert_eq!(
+        src.len(),
+        dst.len(),
+        "Input and output slices must have equal length"
+    );
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         fp32_to_fp16_avx2(src, dst);
     }
 
-    #[cfg(all(not(all(target_arch = "x86_64", target_feature = "avx2")), 
-              target_arch = "aarch64", 
-              target_feature = "neon"))]
+    #[cfg(all(
+        not(all(target_arch = "x86_64", target_feature = "avx2")),
+        target_arch = "aarch64",
+        target_feature = "neon"
+    ))]
     {
         fp32_to_fp16_neon(src, dst);
     }
@@ -48,16 +54,22 @@ pub fn fp32_to_fp16(src: &[f32], dst: &mut [f16]) {
 /// Same as fp32_to_fp16, uses vectorized instructions when available.
 #[inline]
 pub fn fp16_to_fp32(src: &[f16], dst: &mut [f32]) {
-    assert_eq!(src.len(), dst.len(), "Input and output slices must have equal length");
+    assert_eq!(
+        src.len(),
+        dst.len(),
+        "Input and output slices must have equal length"
+    );
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         fp16_to_fp32_avx2(src, dst);
     }
 
-    #[cfg(all(not(all(target_arch = "x86_64", target_feature = "avx2")),
-              target_arch = "aarch64",
-              target_feature = "neon"))]
+    #[cfg(all(
+        not(all(target_arch = "x86_64", target_feature = "avx2")),
+        target_arch = "aarch64",
+        target_feature = "neon"
+    ))]
     {
         fp16_to_fp32_neon(src, dst);
     }
@@ -118,10 +130,7 @@ fn fp32_to_fp16_avx2(src: &[f32], dst: &mut [f16]) {
         while i + 8 <= len {
             let chunk = _mm256_loadu_ps(src.as_ptr().add(i));
             let converted = _mm256_cvtps_ph::<0>(chunk);
-            _mm_storeu_si128(
-                dst.as_mut_ptr().add(i) as *mut __m128i,
-                converted
-            );
+            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, converted);
             i += 8;
         }
     }

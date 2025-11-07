@@ -1,8 +1,8 @@
 //! Benchmark FP16/FP32 conversions
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use movidius_ncapi::conversion::{fp16_to_fp32, fp32_to_fp16};
 use half::f16;
+use movidius_ncapi::conversion::{fp16_to_fp32, fp32_to_fp16};
 
 fn bench_fp32_to_fp16(c: &mut Criterion) {
     let mut group = c.benchmark_group("fp32_to_fp16");

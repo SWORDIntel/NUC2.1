@@ -9,26 +9,23 @@ fn main() -> Result<()> {
     // Create device
     println!("Creating device...");
     let device = Device::create(0)?;
-    
+
     println!("Opening device...");
     device.write().open()?;
-    
+
     println!("Device opened successfully!");
     println!("State: {:?}", device.read().state());
 
     // Create graph
     println!("\nCreating graph...");
     let mut graph = Graph::create("example_graph")?;
-    
+
     // Simulate graph data
     let graph_data = vec![0u8; 1024];
-    
+
     println!("Allocating graph with FIFOs...");
-    let (input_fifo, output_fifo) = graph.allocate_with_fifos(
-        device.clone(),
-        &graph_data,
-    )?;
-    
+    let (input_fifo, output_fifo) = graph.allocate_with_fifos(device.clone(), &graph_data)?;
+
     println!("Graph allocated successfully!");
     println!("State: {:?}", graph.state());
 
@@ -38,13 +35,8 @@ fn main() -> Result<()> {
     let input_bytes = bytemuck::cast_slice(&input_data);
 
     println!("\nSubmitting inference...");
-    graph.queue_inference_with_fifo_elem(
-        &input_fifo,
-        &output_fifo,
-        input_bytes,
-        None,
-    )?;
-    
+    graph.queue_inference_with_fifo_elem(&input_fifo, &output_fifo, input_bytes, None)?;
+
     println!("Inference queued!");
 
     // In a real implementation, we would read from output_fifo here
@@ -56,9 +48,9 @@ fn main() -> Result<()> {
     drop(output_fifo);
     drop(input_fifo);
     drop(graph);
-    
+
     device.write().close()?;
-    
+
     println!("Done!");
     Ok(())
 }

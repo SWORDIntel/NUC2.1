@@ -26,9 +26,9 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use movidius_ncapi::{
-    AnalysisReport, DeviceMetrics, LatencyTracker, MemoryMetrics, MetricsAnalyzer,
-    PerformanceMetrics, PoolMetrics, PoolStats, PoolStatistics, ResourceMetrics,
-    SchedulingStrategy, ThermalMetrics, MultiDevicePool,
+    AnalysisReport, DeviceMetrics, LatencyTracker, MemoryMetrics, MetricsAnalyzer, MultiDevicePool,
+    PerformanceMetrics, PoolMetrics, PoolStatistics, PoolStats, ResourceMetrics,
+    SchedulingStrategy, ThermalMetrics,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -99,7 +99,9 @@ impl App {
             pool,
             throughput_history: vec![vec![]; device_count],
             temp_history: vec![vec![]; device_count],
-            latency_trackers: (0..device_count).map(|_| LatencyTracker::new(1000)).collect(),
+            latency_trackers: (0..device_count)
+                .map(|_| LatencyTracker::new(1000))
+                .collect(),
             temp_samples: vec![Vec::new(); device_count],
             throttle_time: vec![Duration::ZERO; device_count],
             last_metrics: None,
@@ -192,9 +194,10 @@ impl App {
         let mut devices = Vec::new();
 
         for i in 0..self.pool.device_count() {
-            let device = self.pool.get_device(i).ok_or_else(|| {
-                anyhow::anyhow!("Device {} not found", i)
-            })?;
+            let device = self
+                .pool
+                .get_device(i)
+                .ok_or_else(|| anyhow::anyhow!("Device {} not found", i))?;
 
             let device_lock = device.read();
 
@@ -204,7 +207,8 @@ impl App {
             let is_throttling = throttle.is_throttling();
 
             self.temp_samples[i].push(current_temp);
-            let avg_temp = self.temp_samples[i].iter().sum::<f32>() / self.temp_samples[i].len() as f32;
+            let avg_temp =
+                self.temp_samples[i].iter().sum::<f32>() / self.temp_samples[i].len() as f32;
             let peak_temp = self.temp_samples[i].iter().copied().fold(0.0f32, f32::max);
 
             let thermal = ThermalMetrics {
@@ -248,7 +252,8 @@ impl App {
             };
 
             // Resource metrics
-            let (graphs_alloc, graphs_max, fifos_alloc, fifos_max) = device_lock.resource_counts()?;
+            let (graphs_alloc, graphs_max, fifos_alloc, fifos_max) =
+                device_lock.resource_counts()?;
             let resources = ResourceMetrics {
                 graphs_allocated: graphs_alloc,
                 graphs_max,
@@ -328,9 +333,9 @@ fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Header
-            Constraint::Min(10),    // Main content
-            Constraint::Length(3),  // Footer/Controls
+            Constraint::Length(3), // Header
+            Constraint::Min(10),   // Main content
+            Constraint::Length(3), // Footer/Controls
         ])
         .split(f.size());
 
@@ -369,7 +374,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     );
 
     let header = Paragraph::new(title)
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
 
@@ -387,7 +396,11 @@ fn draw_devices(f: &mut Frame, area: Rect, app: &App) {
     let mut items = vec![];
     for i in 0..app.pool.device_count() {
         let load = app.pool.load(i).unwrap_or(0);
-        let selected = if i == app.selected_device { "→ " } else { "  " };
+        let selected = if i == app.selected_device {
+            "→ "
+        } else {
+            "  "
+        };
 
         let status = if let Some(device) = app.pool.get_device(i) {
             if device.read().is_healthy().unwrap_or(false) {
@@ -401,7 +414,9 @@ fn draw_devices(f: &mut Frame, area: Rect, app: &App) {
 
         let line = format!("{}Device {} {} (Load: {})", selected, i, status, load);
         let style = if i == app.selected_device {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -409,8 +424,7 @@ fn draw_devices(f: &mut Frame, area: Rect, app: &App) {
         items.push(ListItem::new(line).style(style));
     }
 
-    let list = List::new(items)
-        .block(Block::default().title("Devices").borders(Borders::ALL));
+    let list = List::new(items).block(Block::default().title("Devices").borders(Borders::ALL));
 
     f.render_widget(list, chunks[0]);
 
@@ -424,7 +438,10 @@ fn draw_devices(f: &mut Frame, area: Rect, app: &App) {
         ];
 
         if let Ok((temp, max_temp)) = device_lock.thermal_stats() {
-            details.push(Line::from(format!("Temperature: {:.1}°C / {:.1}°C", temp, max_temp)));
+            details.push(Line::from(format!(
+                "Temperature: {:.1}°C / {:.1}°C",
+                temp, max_temp
+            )));
         }
 
         if let Ok(throttle) = device_lock.throttling_level() {
@@ -460,8 +477,11 @@ fn draw_devices(f: &mut Frame, area: Rect, app: &App) {
             )));
         }
 
-        let paragraph = Paragraph::new(details)
-            .block(Block::default().title("Device Details").borders(Borders::ALL));
+        let paragraph = Paragraph::new(details).block(
+            Block::default()
+                .title("Device Details")
+                .borders(Borders::ALL),
+        );
 
         f.render_widget(paragraph, chunks[1]);
     }
@@ -523,7 +543,10 @@ fn draw_pool_stats(f: &mut Frame, area: Rect, stats: &PoolStats) {
 
     let text = vec![
         Line::from(format!("Total Load: {}", stats.total_load)),
-        Line::from(format!("Total Throughput: {:.1} inf/s", stats.total_throughput)),
+        Line::from(format!(
+            "Total Throughput: {:.1} inf/s",
+            stats.total_throughput
+        )),
         Line::from(format!("Avg Load: {:.1}", stats.avg_load())),
         Line::from(vec![
             Span::raw("Balance: "),
@@ -532,8 +555,11 @@ fn draw_pool_stats(f: &mut Frame, area: Rect, stats: &PoolStats) {
         ]),
     ];
 
-    let paragraph = Paragraph::new(text)
-        .block(Block::default().title("Pool Statistics").borders(Borders::ALL));
+    let paragraph = Paragraph::new(text).block(
+        Block::default()
+            .title("Pool Statistics")
+            .borders(Borders::ALL),
+    );
 
     f.render_widget(paragraph, area);
 }
@@ -558,11 +584,19 @@ fn draw_load_distribution(f: &mut Frame, area: Rect, app: &App) {
 
     for i in 0..app.pool.device_count() {
         let load = app.pool.load(i).unwrap_or(0);
-        bars.push(Bar::default().value(load as u64).label(format!("D{}", i).into()));
+        bars.push(
+            Bar::default()
+                .value(load as u64)
+                .label(format!("D{}", i).into()),
+        );
     }
 
     let barchart = BarChart::default()
-        .block(Block::default().title("Load Distribution").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Load Distribution")
+                .borders(Borders::ALL),
+        )
         .data(BarGroup::default().bars(&bars))
         .bar_width(5)
         .bar_gap(1)
@@ -588,7 +622,9 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let style = if show_export_msg {
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray)
     };
@@ -659,10 +695,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_app<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-    app: &mut App,
-) -> Result<()> {
+fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
 

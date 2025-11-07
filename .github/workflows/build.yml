@@ -31,9 +31,10 @@ jobs:
       - name: Install kernel build dependencies
         run: |
           apt-get update
+
+          # Install build tools first
           apt-get install -y \
             build-essential \
-            linux-headers-$(uname -r) \
             kmod \
             libelf-dev \
             bc \
@@ -42,9 +43,48 @@ jobs:
             libssl-dev \
             git
 
-          # Verify kernel headers are installed correctly
-          echo "Kernel version: $(uname -r)"
-          ls -la /lib/modules/$(uname -r)/build || echo "Warning: Kernel headers path not found"
+          # Install generic kernel headers (GitHub Actions uses Azure kernels not in repos)
+          # We're cross-compiling, not loading modules, so generic headers are fine
+          apt-get install -y linux-headers-generic || apt-get install -y linux-headers-amd64 || true
+
+          # Find arch-specific kernel headers (NOT -common, that's just shared files)
+          # Explicitly exclude -common directories which only contain shared headers
+          echo "Searching for arch-specific kernel headers..."
+          ls -1d /usr/src/linux-headers-* 2>/dev/null || true
+
+          HEADERS_DIR=$(ls -1d /usr/src/linux-headers-* 2>/dev/null | grep -v '\-common$' | head -n1)
+
+          if [ -z "$HEADERS_DIR" ]; then
+            echo "ERROR: No arch-specific kernel headers found"
+            echo "Available directories in /usr/src:"
+            ls -la /usr/src
+            exit 1
+          fi
+
+          echo "✓ Using kernel headers from: ${HEADERS_DIR}"
+
+          # Prepare kernel headers if needed (creates include/config/auto.conf)
+          cd "${HEADERS_DIR}"
+          if [ ! -f "include/config/auto.conf" ]; then
+            echo "Preparing kernel headers..."
+            # Arch-specific headers should already have proper Makefiles
+            make oldconfig && make modules_prepare
+          else
+            echo "Kernel headers already prepared"
+          fi
+          cd -
+
+          # Create symlink for current kernel if needed
+          KERNEL_VERSION=$(uname -r)
+          if [ ! -d "/lib/modules/${KERNEL_VERSION}/build" ]; then
+            mkdir -p "/lib/modules/${KERNEL_VERSION}"
+            ln -sf "${HEADERS_DIR}" "/lib/modules/${KERNEL_VERSION}/build"
+          fi
+
+          echo "Build kernel: $(uname -r)"
+          echo "Headers path: /lib/modules/$(uname -r)/build -> ${HEADERS_DIR}"
+          echo "Checking for auto.conf..."
+          ls -la "${HEADERS_DIR}/include/config/auto.conf" || echo "Warning: auto.conf not found"
 
       - name: Build kernel modules
         run: |

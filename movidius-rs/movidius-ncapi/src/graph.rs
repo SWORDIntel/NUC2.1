@@ -67,11 +67,7 @@ impl Graph {
         })
     }
 
-    pub fn allocate(
-        &mut self,
-        device: Arc<RwLock<Device>>,
-        graph_buffer: &[u8],
-    ) -> Result<()> {
+    pub fn allocate(&mut self, device: Arc<RwLock<Device>>, graph_buffer: &[u8]) -> Result<()> {
         if self.state != GraphState::Created {
             tracing::error!(
                 "Cannot allocate graph '{}' in state {:?}, must be Created",
@@ -144,9 +140,7 @@ impl Graph {
         input_tensor: &[u8],
         user_param: Option<usize>,
     ) -> Result<()> {
-        if self.state != GraphState::Allocated
-            && self.state != GraphState::WaitingForBuffers
-        {
+        if self.state != GraphState::Allocated && self.state != GraphState::WaitingForBuffers {
             return Err(Error::Status(Status::NotAllocated));
         }
 

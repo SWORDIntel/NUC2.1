@@ -255,9 +255,10 @@ impl MultiDevicePool {
     /// Open all devices in pool
     pub fn open_all(&self) -> Result<()> {
         for (idx, device) in self.devices.iter().enumerate() {
-            device.write().open().map_err(|e| {
-                Error::DeviceError(format!("Failed to open device {}: {}", idx, e))
-            })?;
+            device
+                .write()
+                .open()
+                .map_err(|e| Error::DeviceError(format!("Failed to open device {}: {}", idx, e)))?;
         }
         tracing::info!("Opened {} devices in pool", self.device_count());
         Ok(())

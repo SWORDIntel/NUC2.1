@@ -189,7 +189,11 @@ impl Fifo {
         }
 
         if self.fifo_type != FifoType::HostWo {
-            tracing::error!("FIFO '{}' is not write-only (type: {:?})", self.name, self.fifo_type);
+            tracing::error!(
+                "FIFO '{}' is not write-only (type: {:?})",
+                self.name,
+                self.fifo_type
+            );
             return Err(Error::Status(Status::Unauthorized));
         }
 
@@ -205,7 +209,11 @@ impl Fifo {
             return Err(Error::Status(Status::InvalidDataLength));
         }
 
-        tracing::trace!("Writing {} bytes to FIFO '{}'", input_tensor.len(), self.name);
+        tracing::trace!(
+            "Writing {} bytes to FIFO '{}'",
+            input_tensor.len(),
+            self.name
+        );
 
         // Convert data type if needed
         let data = self.convert_to_device_format(input_tensor)?;
@@ -218,10 +226,14 @@ impl Fifo {
                 return Err(Error::Status(Status::Busy));
             }
             // Busy-wait for space (will be replaced with proper blocking)
-            while self.queue.push(FifoElement {
-                data: self.convert_to_device_format(input_tensor)?,
-                user_param,
-            }).is_err() {
+            while self
+                .queue
+                .push(FifoElement {
+                    data: self.convert_to_device_format(input_tensor)?,
+                    user_param,
+                })
+                .is_err()
+            {
                 std::hint::spin_loop();
             }
         }
@@ -238,7 +250,11 @@ impl Fifo {
         }
 
         if self.fifo_type != FifoType::HostRo {
-            tracing::error!("FIFO '{}' is not read-only (type: {:?})", self.name, self.fifo_type);
+            tracing::error!(
+                "FIFO '{}' is not read-only (type: {:?})",
+                self.name,
+                self.fifo_type
+            );
             return Err(Error::Status(Status::Unauthorized));
         }
 
@@ -277,9 +293,7 @@ impl Fifo {
             }
             FifoOption::State => Ok((self.state as i32).to_le_bytes().to_vec()),
             FifoOption::Name => Ok(self.name.as_bytes().to_vec()),
-            FifoOption::ElementDataSize => {
-                Ok(self.tensor_desc.total_size.to_le_bytes().to_vec())
-            }
+            FifoOption::ElementDataSize => Ok(self.tensor_desc.total_size.to_le_bytes().to_vec()),
         }
     }
 
@@ -291,9 +305,11 @@ impl Fifo {
 
         match option {
             FifoOption::Type => {
-                let val = i32::from_le_bytes(value.try_into().map_err(|_| {
-                    Error::Status(Status::InvalidParameters)
-                })?);
+                let val = i32::from_le_bytes(
+                    value
+                        .try_into()
+                        .map_err(|_| Error::Status(Status::InvalidParameters))?,
+                );
                 self.fifo_type = match val {
                     0 => FifoType::HostRo,
                     1 => FifoType::HostWo,
@@ -301,9 +317,11 @@ impl Fifo {
                 };
             }
             FifoOption::DataType => {
-                let val = i32::from_le_bytes(value.try_into().map_err(|_| {
-                    Error::Status(Status::InvalidParameters)
-                })?);
+                let val = i32::from_le_bytes(
+                    value
+                        .try_into()
+                        .map_err(|_| Error::Status(Status::InvalidParameters))?,
+                );
                 self.data_type = match val {
                     0 => FifoDataType::FP16,
                     1 => FifoDataType::FP32,
@@ -311,9 +329,11 @@ impl Fifo {
                 };
             }
             FifoOption::DontBlock => {
-                let val = i32::from_le_bytes(value.try_into().map_err(|_| {
-                    Error::Status(Status::InvalidParameters)
-                })?);
+                let val = i32::from_le_bytes(
+                    value
+                        .try_into()
+                        .map_err(|_| Error::Status(Status::InvalidParameters))?,
+                );
                 self.dont_block = val != 0;
             }
             _ => return Err(Error::Status(Status::InvalidParameters)),
@@ -331,8 +351,7 @@ impl Fifo {
         }
 
         // Convert FP32 host -> FP16 device
-        if self.tensor_desc.data_type == FifoDataType::FP32
-            && self.data_type == FifoDataType::FP16 
+        if self.tensor_desc.data_type == FifoDataType::FP32 && self.data_type == FifoDataType::FP16
         {
             let fp32_slice = bytemuck::cast_slice::<u8, f32>(data);
             let fp16_vec = crate::conversion::fp32_to_fp16_vec(fp32_slice);
@@ -352,8 +371,7 @@ impl Fifo {
         }
 
         // Convert FP16 device -> FP32 host
-        if self.tensor_desc.data_type == FifoDataType::FP16
-            && self.data_type == FifoDataType::FP32 
+        if self.tensor_desc.data_type == FifoDataType::FP16 && self.data_type == FifoDataType::FP32
         {
             let fp16_slice = bytemuck::cast_slice::<u8, half::f16>(data);
             let fp32_vec = crate::conversion::fp16_to_fp32_vec(fp16_slice);

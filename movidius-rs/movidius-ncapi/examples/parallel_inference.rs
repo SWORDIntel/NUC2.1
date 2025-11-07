@@ -3,13 +3,16 @@
 //! This example demonstrates running inference on two Movidius devices in parallel
 //! to achieve ~2x throughput compared to a single device.
 
-use movidius_ncapi::{Device, Graph, FifoDataType, TensorDescriptor, Error};
+use movidius_ncapi::{Device, Error, FifoDataType, Graph, TensorDescriptor};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 fn run_inference_on_device(device_index: i32, iterations: usize) -> Result<f64, Error> {
-    println!("Thread {}: Starting on device {}", device_index, device_index);
+    println!(
+        "Thread {}: Starting on device {}",
+        device_index, device_index
+    );
 
     // Create and open device
     let device = Device::create(device_index)?;
@@ -34,29 +37,37 @@ fn run_inference_on_device(device_index: i32, iterations: usize) -> Result<f64, 
     let input_desc = TensorDescriptor::image(224, 224, 3, FifoDataType::FP32);
     let input_data = vec![0u8; input_desc.total_size as usize];
 
-    println!("Thread {}: Starting {} iterations", device_index, iterations);
+    println!(
+        "Thread {}: Starting {} iterations",
+        device_index, iterations
+    );
 
     let start = Instant::now();
 
     for i in 0..iterations {
         // Queue inference
-        graph.queue_inference_with_fifo_elem(
-            &input_fifo,
-            &output_fifo,
-            &input_data,
-            Some(i),
-        )?;
+        graph.queue_inference_with_fifo_elem(&input_fifo, &output_fifo, &input_data, Some(i))?;
 
         if (i + 1) % 10 == 0 {
-            println!("Thread {}: Completed {}/{} iterations", device_index, i + 1, iterations);
+            println!(
+                "Thread {}: Completed {}/{} iterations",
+                device_index,
+                i + 1,
+                iterations
+            );
         }
     }
 
     let elapsed = start.elapsed();
     let fps = iterations as f64 / elapsed.as_secs_f64();
 
-    println!("Thread {}: Completed {} iterations in {:.2}s ({:.2} FPS)",
-        device_index, iterations, elapsed.as_secs_f64(), fps);
+    println!(
+        "Thread {}: Completed {} iterations in {:.2}s ({:.2} FPS)",
+        device_index,
+        iterations,
+        elapsed.as_secs_f64(),
+        fps
+    );
 
     // Clean up
     device.write().close()?;

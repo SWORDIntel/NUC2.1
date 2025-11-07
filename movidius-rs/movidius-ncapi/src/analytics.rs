@@ -243,12 +243,8 @@ impl LatencyTracker {
         }
 
         let avg = self.avg();
-        let variance = self
-            .samples
-            .iter()
-            .map(|x| (x - avg).powi(2))
-            .sum::<f64>()
-            / self.samples.len() as f64;
+        let variance =
+            self.samples.iter().map(|x| (x - avg).powi(2)).sum::<f64>() / self.samples.len() as f64;
         variance.sqrt()
     }
 
@@ -295,7 +291,10 @@ impl MetricsAnalyzer {
                     severity: IssueSeverity::Warning,
                     device_id: Some(idx),
                     category: IssueCategory::Thermal,
-                    description: format!("Device {} temperature elevated: {:.1}°C", idx, device.thermal.current_temp),
+                    description: format!(
+                        "Device {} temperature elevated: {:.1}°C",
+                        idx, device.thermal.current_temp
+                    ),
                     recommendation: "Monitor temperature, ensure adequate airflow".to_string(),
                 });
             }
@@ -308,7 +307,10 @@ impl MetricsAnalyzer {
                     severity: IssueSeverity::Critical,
                     device_id: Some(idx),
                     category: IssueCategory::Memory,
-                    description: format!("Device {} memory critical: {:.1}%", idx, device.memory.percent),
+                    description: format!(
+                        "Device {} memory critical: {:.1}%",
+                        idx, device.memory.percent
+                    ),
                     recommendation: "Reduce batch size or model size".to_string(),
                 });
             } else if device.memory.percent > 80.0 {
@@ -316,7 +318,10 @@ impl MetricsAnalyzer {
                     severity: IssueSeverity::Warning,
                     device_id: Some(idx),
                     category: IssueCategory::Memory,
-                    description: format!("Device {} memory high: {:.1}%", idx, device.memory.percent),
+                    description: format!(
+                        "Device {} memory high: {:.1}%",
+                        idx, device.memory.percent
+                    ),
                     recommendation: "Consider optimizing memory usage".to_string(),
                 });
             }
@@ -329,8 +334,13 @@ impl MetricsAnalyzer {
                     severity: IssueSeverity::Warning,
                     device_id: Some(idx),
                     category: IssueCategory::Performance,
-                    description: format!("Device {} low efficiency: {:.1}%", idx, device.performance.efficiency * 100.0),
-                    recommendation: "Check pipeline for bottlenecks (input/output starvation)".to_string(),
+                    description: format!(
+                        "Device {} low efficiency: {:.1}%",
+                        idx,
+                        device.performance.efficiency * 100.0
+                    ),
+                    recommendation: "Check pipeline for bottlenecks (input/output starvation)"
+                        .to_string(),
                 });
             }
 
@@ -339,8 +349,12 @@ impl MetricsAnalyzer {
                     severity: IssueSeverity::Warning,
                     device_id: Some(idx),
                     category: IssueCategory::Performance,
-                    description: format!("Device {} high receive wait: {:.1}μs", idx, device.performance.receive_wait_us),
-                    recommendation: "Increase FIFO depth or reduce data transfer overhead".to_string(),
+                    description: format!(
+                        "Device {} high receive wait: {:.1}μs",
+                        idx, device.performance.receive_wait_us
+                    ),
+                    recommendation: "Increase FIFO depth or reduce data transfer overhead"
+                        .to_string(),
                 });
             }
 
@@ -362,7 +376,10 @@ impl MetricsAnalyzer {
                 severity: IssueSeverity::Warning,
                 device_id: None,
                 category: IssueCategory::LoadBalance,
-                description: format!("Load imbalance: {:.1}%", metrics.pool_stats.load_imbalance * 100.0),
+                description: format!(
+                    "Load imbalance: {:.1}%",
+                    metrics.pool_stats.load_imbalance * 100.0
+                ),
                 recommendation: "Try different scheduling strategy (current: {})".to_string(),
             });
         }
@@ -374,7 +391,10 @@ impl MetricsAnalyzer {
                     severity: IssueSeverity::Warning,
                     device_id: Some(idx),
                     category: IssueCategory::Resource,
-                    description: format!("Device {} graph resources near limit: {:.1}%", idx, device.resources.graph_utilization),
+                    description: format!(
+                        "Device {} graph resources near limit: {:.1}%",
+                        idx, device.resources.graph_utilization
+                    ),
                     recommendation: "May need to add more devices to pool".to_string(),
                 });
             }
@@ -384,7 +404,10 @@ impl MetricsAnalyzer {
                     severity: IssueSeverity::Warning,
                     device_id: Some(idx),
                     category: IssueCategory::Resource,
-                    description: format!("Device {} FIFO resources near limit: {:.1}%", idx, device.resources.fifo_utilization),
+                    description: format!(
+                        "Device {} FIFO resources near limit: {:.1}%",
+                        idx, device.resources.fifo_utilization
+                    ),
                     recommendation: "Optimize FIFO usage or add more devices".to_string(),
                 });
             }
@@ -398,11 +421,17 @@ impl MetricsAnalyzer {
         let mut score = 100u32;
 
         // Deduct for critical issues
-        let critical_count = issues.iter().filter(|i| i.severity == IssueSeverity::Critical).count();
+        let critical_count = issues
+            .iter()
+            .filter(|i| i.severity == IssueSeverity::Critical)
+            .count();
         score = score.saturating_sub(critical_count as u32 * 20);
 
         // Deduct for warnings
-        let warning_count = issues.iter().filter(|i| i.severity == IssueSeverity::Warning).count();
+        let warning_count = issues
+            .iter()
+            .filter(|i| i.severity == IssueSeverity::Warning)
+            .count();
         score = score.saturating_sub(warning_count as u32 * 5);
 
         // Bonus for good metrics
@@ -422,20 +451,35 @@ impl MetricsAnalyzer {
     }
 
     /// Generate summary recommendations
-    pub fn generate_recommendations(metrics: &PoolMetrics, issues: &[PerformanceIssue]) -> Vec<String> {
+    pub fn generate_recommendations(
+        metrics: &PoolMetrics,
+        issues: &[PerformanceIssue],
+    ) -> Vec<String> {
         let mut recs = Vec::new();
 
         // Group issues by category
-        let thermal_issues = issues.iter().filter(|i| i.category == IssueCategory::Thermal).count();
-        let memory_issues = issues.iter().filter(|i| i.category == IssueCategory::Memory).count();
-        let perf_issues = issues.iter().filter(|i| i.category == IssueCategory::Performance).count();
+        let thermal_issues = issues
+            .iter()
+            .filter(|i| i.category == IssueCategory::Thermal)
+            .count();
+        let memory_issues = issues
+            .iter()
+            .filter(|i| i.category == IssueCategory::Memory)
+            .count();
+        let perf_issues = issues
+            .iter()
+            .filter(|i| i.category == IssueCategory::Performance)
+            .count();
 
         if thermal_issues > 0 {
             recs.push("THERMAL: Improve cooling (add fans, better ventilation, or reduce ambient temperature)".to_string());
         }
 
         if memory_issues > 0 {
-            recs.push("MEMORY: Optimize model size or reduce batch size to lower memory pressure".to_string());
+            recs.push(
+                "MEMORY: Optimize model size or reduce batch size to lower memory pressure"
+                    .to_string(),
+            );
         }
 
         if perf_issues > 0 {
@@ -443,7 +487,10 @@ impl MetricsAnalyzer {
         }
 
         if !metrics.pool_stats.is_balanced {
-            recs.push(format!("LOAD BALANCE: Try switching from {} to a different scheduling strategy", metrics.strategy));
+            recs.push(format!(
+                "LOAD BALANCE: Try switching from {} to a different scheduling strategy",
+                metrics.strategy
+            ));
         }
 
         // Device-specific recommendations

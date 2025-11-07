@@ -1,10 +1,10 @@
 //! Production-ready C FFI bindings with proper lifetime management
 
 use crate::*;
+use parking_lot::RwLock;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::ptr;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 // Opaque handle types for C
 #[repr(C)]
@@ -150,9 +150,7 @@ pub unsafe extern "C" fn ncDeviceClose(device_handle: *mut ncDeviceHandle_t) -> 
 /// - device_handle must be a valid pointer to a handle
 /// - The handle must not be used after this call
 #[no_mangle]
-pub unsafe extern "C" fn ncDeviceDestroy(
-    device_handle: *mut *mut ncDeviceHandle_t,
-) -> c_int {
+pub unsafe extern "C" fn ncDeviceDestroy(device_handle: *mut *mut ncDeviceHandle_t) -> c_int {
     if device_handle.is_null() || unsafe { (*device_handle).is_null() } {
         return Status::InvalidHandle.to_i32();
     }
@@ -245,13 +243,12 @@ pub unsafe extern "C" fn ncGraphAllocate(
         return Status::InvalidParameters.to_i32();
     }
 
-    match (unsafe { c_to_device(device_handle) }, unsafe { c_to_graph(graph_handle) }) {
+    match (unsafe { c_to_device(device_handle) }, unsafe {
+        c_to_graph(graph_handle)
+    }) {
         (Ok(device), Ok(graph)) => {
             let buffer = unsafe {
-                std::slice::from_raw_parts(
-                    graph_buffer as *const u8,
-                    graph_buffer_length as usize,
-                )
+                std::slice::from_raw_parts(graph_buffer as *const u8, graph_buffer_length as usize)
             };
 
             match graph.write().allocate(device, buffer) {
@@ -280,13 +277,12 @@ pub unsafe extern "C" fn ncGraphAllocateWithFifos(
         return Status::InvalidParameters.to_i32();
     }
 
-    match (unsafe { c_to_device(device_handle) }, unsafe { c_to_graph(graph_handle) }) {
+    match (unsafe { c_to_device(device_handle) }, unsafe {
+        c_to_graph(graph_handle)
+    }) {
         (Ok(device), Ok(graph)) => {
             let buffer = unsafe {
-                std::slice::from_raw_parts(
-                    graph_buffer as *const u8,
-                    graph_buffer_length as usize,
-                )
+                std::slice::from_raw_parts(graph_buffer as *const u8, graph_buffer_length as usize)
             };
 
             match graph.write().allocate_with_fifos(device, buffer) {
@@ -309,9 +305,7 @@ pub unsafe extern "C" fn ncGraphAllocateWithFifos(
 /// # Safety
 /// - graph_handle must be a valid pointer to a handle
 #[no_mangle]
-pub unsafe extern "C" fn ncGraphDestroy(
-    graph_handle: *mut *mut ncGraphHandle_t,
-) -> c_int {
+pub unsafe extern "C" fn ncGraphDestroy(graph_handle: *mut *mut ncGraphHandle_t) -> c_int {
     if graph_handle.is_null() || unsafe { (*graph_handle).is_null() } {
         return Status::InvalidHandle.to_i32();
     }
@@ -413,33 +407,27 @@ pub unsafe extern "C" fn ncFifoReadElem(
     }
 
     match unsafe { c_to_fifo(fifo_handle) } {
-        Ok(fifo) => {
-            match fifo.read().read_elem() {
-                Ok((data, user_data)) => {
-                    let out_len = unsafe { *output_data_len as usize };
-                    if data.len() > out_len {
-                        unsafe { *output_data_len = data.len() as c_uint };
-                        return Status::InvalidDataLength.to_i32();
-                    }
-
-                    unsafe {
-                        ptr::copy_nonoverlapping(
-                            data.as_ptr(),
-                            output_data as *mut u8,
-                            data.len(),
-                        );
-                        *output_data_len = data.len() as c_uint;
-
-                        if !user_param.is_null() {
-                            *user_param = user_data.unwrap_or(0) as *mut c_void;
-                        }
-                    }
-
-                    Status::Ok.to_i32()
+        Ok(fifo) => match fifo.read().read_elem() {
+            Ok((data, user_data)) => {
+                let out_len = unsafe { *output_data_len as usize };
+                if data.len() > out_len {
+                    unsafe { *output_data_len = data.len() as c_uint };
+                    return Status::InvalidDataLength.to_i32();
                 }
-                Err(e) => e.to_status().to_i32(),
+
+                unsafe {
+                    ptr::copy_nonoverlapping(data.as_ptr(), output_data as *mut u8, data.len());
+                    *output_data_len = data.len() as c_uint;
+
+                    if !user_param.is_null() {
+                        *user_param = user_data.unwrap_or(0) as *mut c_void;
+                    }
+                }
+
+                Status::Ok.to_i32()
             }
-        }
+            Err(e) => e.to_status().to_i32(),
+        },
         Err(e) => e.to_status().to_i32(),
     }
 }
@@ -449,9 +437,7 @@ pub unsafe extern "C" fn ncFifoReadElem(
 /// # Safety
 /// - fifo_handle must be valid pointer to handle
 #[no_mangle]
-pub unsafe extern "C" fn ncFifoDestroy(
-    fifo_handle: *mut *mut ncFifoHandle_t,
-) -> c_int {
+pub unsafe extern "C" fn ncFifoDestroy(fifo_handle: *mut *mut ncFifoHandle_t) -> c_int {
     if fifo_handle.is_null() || unsafe { (*fifo_handle).is_null() } {
         return Status::InvalidHandle.to_i32();
     }
@@ -501,11 +487,7 @@ pub unsafe extern "C" fn ncGlobalGetOption(
             }
 
             unsafe {
-                ptr::copy_nonoverlapping(
-                    value.as_ptr(),
-                    data as *mut u8,
-                    req_len,
-                );
+                ptr::copy_nonoverlapping(value.as_ptr(), data as *mut u8, req_len);
                 *data_length = req_len as c_uint;
             }
             Status::Ok.to_i32()
@@ -550,11 +532,11 @@ mod tests {
     fn test_handle_conversions() {
         let device = Device::create(0).unwrap();
         let c_handle = device_to_c(device.clone());
-        
+
         unsafe {
             let back = c_to_device(c_handle).unwrap();
             assert!(Arc::ptr_eq(&device, &back));
-            
+
             // Cleanup
             let mut handle_ptr = c_handle;
             ncDeviceDestroy(&mut handle_ptr as *mut *mut _);
