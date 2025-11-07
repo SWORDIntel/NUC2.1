@@ -1,7 +1,7 @@
 //! High-performance io_uring submission and completion
 
 use super::{Error, Result};
-use io_uring::{opcode, types, IoUring};
+use io_uring::{opcode, IoUring};
 use std::os::unix::io::RawFd;
 
 /// io_uring submitter for maximum performance
@@ -18,7 +18,7 @@ impl UringSubmitter {
 
     /// Submit inference request (placeholder - actual implementation would use proper ops)
     #[inline]
-    pub fn submit_inference(&mut self, fd: RawFd, _cmd_op: u32, user_data: u64) -> Result<()> {
+    pub fn submit_inference(&mut self, _fd: RawFd, _cmd_op: u32, user_data: u64) -> Result<()> {
         // Use NOP for now as UringCmd is not in this version
         let entry = opcode::Nop::new().build().user_data(user_data);
 
