@@ -18,16 +18,24 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Prepare kernel headers for module builds
-RUN HEADERS_DIR=$(find /usr/src -maxdepth 1 -name "linux-headers-*-common" -type d | head -n1) && \
-    if [ -n "$HEADERS_DIR" ] && [ ! -f "$HEADERS_DIR/include/config/auto.conf" ]; then \
-        cd "$HEADERS_DIR" && \
-        make defconfig && \
-        make modules_prepare && \
-        cd -; \
+# Use arch-specific headers (e.g., linux-headers-*-amd64), NOT -common
+RUN HEADERS_DIR=$(find /usr/src -maxdepth 1 -type d -name "linux-headers-*-amd64" | head -n1) && \
+    if [ -z "$HEADERS_DIR" ]; then \
+        echo "ERROR: No arch-specific kernel headers found" && \
+        ls -la /usr/src && \
+        exit 1; \
+    fi && \
+    echo "Using headers: $HEADERS_DIR" && \
+    cd "$HEADERS_DIR" && \
+    if [ ! -f "include/config/auto.conf" ]; then \
+        echo "Preparing kernel headers..." && \
+        make oldconfig && \
+        make modules_prepare; \
     fi && \
     KERNEL_VERSION=$(uname -r) && \
     mkdir -p /lib/modules/$KERNEL_VERSION && \
-    ln -sf "$HEADERS_DIR" /lib/modules/$KERNEL_VERSION/build
+    ln -sf "$HEADERS_DIR" /lib/modules/$KERNEL_VERSION/build && \
+    echo "Headers prepared at: $HEADERS_DIR"
 
 # Copy kernel driver source
 WORKDIR /build/kernel

@@ -45,13 +45,14 @@ jobs:
 
           # Install generic kernel headers (GitHub Actions uses Azure kernels not in repos)
           # We're cross-compiling, not loading modules, so generic headers are fine
-          apt-get install -y linux-headers-generic || true
+          apt-get install -y linux-headers-generic || apt-get install -y linux-headers-amd64 || true
 
-          # Find available kernel headers (-common directory)
-          HEADERS_DIR=$(find /usr/src -maxdepth 1 -name "linux-headers-*-common" -type d 2>/dev/null | head -n1)
+          # Find arch-specific kernel headers (NOT -common, that's just shared files)
+          # Look for directories like linux-headers-*-amd64 or linux-headers-*-generic
+          HEADERS_DIR=$(find /usr/src -maxdepth 1 -type d \( -name "linux-headers-*-amd64" -o -name "linux-headers-*-generic" \) 2>/dev/null | head -n1)
 
           if [ -z "$HEADERS_DIR" ]; then
-            echo "ERROR: No kernel headers found"
+            echo "ERROR: No arch-specific kernel headers found"
             echo "Available directories in /usr/src:"
             ls -la /usr/src
             exit 1
@@ -59,12 +60,14 @@ jobs:
 
           echo "Using kernel headers from: ${HEADERS_DIR}"
 
-          # Prepare kernel headers (needed for module builds)
+          # Prepare kernel headers if needed (creates include/config/auto.conf)
           cd "${HEADERS_DIR}"
           if [ ! -f "include/config/auto.conf" ]; then
             echo "Preparing kernel headers..."
-            make defconfig
-            make modules_prepare
+            # Arch-specific headers should already have proper Makefiles
+            make oldconfig && make modules_prepare
+          else
+            echo "Kernel headers already prepared"
           fi
           cd -
 
@@ -77,7 +80,8 @@ jobs:
 
           echo "Build kernel: $(uname -r)"
           echo "Headers path: /lib/modules/$(uname -r)/build -> ${HEADERS_DIR}"
-          ls -la /lib/modules/$(uname -r)/build/include/config/auto.conf || echo "Warning: auto.conf not found"
+          echo "Checking for auto.conf..."
+          ls -la "${HEADERS_DIR}/include/config/auto.conf" || echo "Warning: auto.conf not found"
 
       - name: Build kernel modules
         run: |
