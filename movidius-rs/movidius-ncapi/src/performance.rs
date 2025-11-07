@@ -207,6 +207,11 @@ impl PerformanceCounter {
         }
         count as f64 / elapsed
     }
+
+    /// Get total number of inferences
+    pub fn total_inferences(&self) -> u64 {
+        self.inference_count.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for PerformanceCounter {

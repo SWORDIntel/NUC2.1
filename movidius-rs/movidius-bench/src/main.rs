@@ -16,6 +16,8 @@
 //! - Space: Pause/Resume
 //! - ↑/↓: Scroll devices
 //! - s: Cycle scheduling strategy
+//! - e: Export comprehensive report (JSON)
+//! - a: Toggle analysis view
 
 use anyhow::Result;
 use crossterm::{
@@ -23,7 +25,11 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use movidius_ncapi::{MultiDevicePool, PoolStats, SchedulingStrategy};
+use movidius_ncapi::{
+    AnalysisReport, DeviceMetrics, LatencyTracker, MemoryMetrics, MetricsAnalyzer,
+    PerformanceMetrics, PoolMetrics, PoolStats, PoolStatistics, ResourceMetrics,
+    SchedulingStrategy, ThermalMetrics, MultiDevicePool,
+};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -32,8 +38,9 @@ use ratatui::{
     widgets::{Bar, BarChart, BarGroup, Block, Borders, List, ListItem, Paragraph, Sparkline},
     Frame, Terminal,
 };
+use std::fs;
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Application state
 struct App {
@@ -46,11 +53,32 @@ struct App {
     /// Temperature history
     temp_history: Vec<Vec<u64>>,
 
+    /// Latency trackers per device
+    latency_trackers: Vec<LatencyTracker>,
+
+    /// Temperature accumulation for averaging
+    temp_samples: Vec<Vec<f32>>,
+
+    /// Throttle time tracking
+    throttle_time: Vec<Duration>,
+
+    /// Last metrics snapshot
+    last_metrics: Option<PoolMetrics>,
+
     /// Current selected device
     selected_device: usize,
 
     /// Paused state
     paused: bool,
+
+    /// Show analysis view
+    show_analysis: bool,
+
+    /// Export notification
+    export_msg: Option<String>,
+
+    /// Export message timestamp
+    export_msg_time: Option<Instant>,
 
     /// Start time for uptime calculation
     start_time: Instant,
@@ -71,8 +99,15 @@ impl App {
             pool,
             throughput_history: vec![vec![]; device_count],
             temp_history: vec![vec![]; device_count],
+            latency_trackers: (0..device_count).map(|_| LatencyTracker::new(1000)).collect(),
+            temp_samples: vec![Vec::new(); device_count],
+            throttle_time: vec![Duration::ZERO; device_count],
+            last_metrics: None,
             selected_device: 0,
             paused: false,
+            show_analysis: false,
+            export_msg: None,
+            export_msg_time: None,
             start_time: Instant::now(),
             last_update: Instant::now(),
         })
@@ -140,6 +175,151 @@ impl App {
     /// Toggle pause
     fn toggle_pause(&mut self) {
         self.paused = !self.paused;
+    }
+
+    /// Toggle analysis view
+    fn toggle_analysis(&mut self) {
+        self.show_analysis = !self.show_analysis;
+    }
+
+    /// Collect comprehensive metrics
+    fn collect_metrics(&mut self) -> Result<PoolMetrics> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut devices = Vec::new();
+
+        for i in 0..self.pool.device_count() {
+            let device = self.pool.get_device(i).ok_or_else(|| {
+                anyhow::anyhow!("Device {} not found", i)
+            })?;
+
+            let device_lock = device.read();
+
+            // Thermal metrics
+            let (current_temp, max_temp) = device_lock.thermal_stats()?;
+            let throttle = device_lock.throttling_level()?;
+            let is_throttling = throttle.is_throttling();
+
+            self.temp_samples[i].push(current_temp);
+            let avg_temp = self.temp_samples[i].iter().sum::<f32>() / self.temp_samples[i].len() as f32;
+            let peak_temp = self.temp_samples[i].iter().copied().fold(0.0f32, f32::max);
+
+            let thermal = ThermalMetrics {
+                current_temp,
+                max_temp,
+                throttle_level: throttle as u8,
+                is_throttling,
+                avg_temp,
+                peak_temp,
+                throttle_time: self.throttle_time[i].as_secs_f32(),
+            };
+
+            // Memory metrics
+            let (used, total) = device_lock.memory_usage()?;
+            let percent = (used as f64 / total as f64 * 100.0) as f32;
+            let memory = MemoryMetrics {
+                total,
+                used,
+                percent,
+                avg_used: used, // Simplified for now
+                peak_used: used,
+                alloc_failures: 0,
+            };
+
+            // Performance metrics
+            let perf_counter = self.pool.performance(i).unwrap();
+            let throughput = perf_counter.throughput();
+
+            let performance = PerformanceMetrics {
+                total_inferences: perf_counter.total_inferences(),
+                throughput,
+                avg_latency_ms: self.latency_trackers[i].avg(),
+                p50_latency_ms: self.latency_trackers[i].percentile(50.0),
+                p95_latency_ms: self.latency_trackers[i].percentile(95.0),
+                p99_latency_ms: self.latency_trackers[i].percentile(99.0),
+                max_latency_ms: self.latency_trackers[i].max(),
+                min_latency_ms: self.latency_trackers[i].min(),
+                latency_stddev_ms: self.latency_trackers[i].stddev(),
+                efficiency: 0.85, // Placeholder - would calculate from actual pipeline metrics
+                receive_wait_us: 50.0, // Placeholder
+            };
+
+            // Resource metrics
+            let (graphs_alloc, graphs_max, fifos_alloc, fifos_max) = device_lock.resource_counts()?;
+            let resources = ResourceMetrics {
+                graphs_allocated: graphs_alloc,
+                graphs_max,
+                graph_utilization: (graphs_alloc as f32 / graphs_max as f32 * 100.0),
+                fifos_allocated: fifos_alloc,
+                fifos_max,
+                fifo_utilization: (fifos_alloc as f32 / fifos_max as f32 * 100.0),
+                queue_depth: self.pool.load(i).unwrap_or(0),
+            };
+
+            devices.push(DeviceMetrics {
+                device_id: i,
+                timestamp,
+                thermal,
+                memory,
+                performance,
+                resources,
+            });
+        }
+
+        let pool_stats_basic = self.pool.pool_stats();
+        let pool_stats = PoolStatistics {
+            total_throughput: pool_stats_basic.total_throughput,
+            avg_throughput: pool_stats_basic.avg_throughput(),
+            load_imbalance: pool_stats_basic.load_imbalance,
+            is_balanced: pool_stats_basic.is_balanced(),
+            total_queue_depth: pool_stats_basic.total_load,
+            any_throttling: devices.iter().any(|d| d.thermal.is_throttling),
+            any_memory_critical: devices.iter().any(|d| d.memory.percent > 90.0),
+        };
+
+        let metrics = PoolMetrics {
+            timestamp,
+            device_count: self.pool.device_count(),
+            strategy: format!("{:?}", self.pool.strategy()),
+            devices,
+            pool_stats,
+        };
+
+        self.last_metrics = Some(metrics.clone());
+        Ok(metrics)
+    }
+
+    /// Export comprehensive report
+    fn export_report(&mut self) -> Result<()> {
+        let metrics = self.collect_metrics()?;
+        let issues = MetricsAnalyzer::analyze(&metrics);
+        let health_score = MetricsAnalyzer::calculate_health_score(&metrics, &issues);
+        let recommendations = MetricsAnalyzer::generate_recommendations(&metrics, &issues);
+
+        let report = AnalysisReport {
+            start_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            duration_secs: self.start_time.elapsed().as_secs_f64(),
+            metrics,
+            issues,
+            health_score,
+            recommendations,
+        };
+
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let filename = format!("movidius_benchmark_{}.json", timestamp);
+        let json = serde_json::to_string_pretty(&report)?;
+        fs::write(&filename, json)?;
+
+        self.export_msg = Some(format!("Report exported: {}", filename));
+        self.export_msg_time = Some(Instant::now());
+
+        Ok(())
     }
 }
 
@@ -393,13 +573,30 @@ fn draw_load_distribution(f: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Draw footer with controls
-fn draw_footer(f: &mut Frame, area: Rect, _app: &App) {
-    let controls = Paragraph::new(
-        "Controls: [q]uit | [r]eset | [space] pause/resume | [↑/↓] select device | [s] cycle strategy",
-    )
-    .style(Style::default().fg(Color::Gray))
-    .alignment(Alignment::Center)
-    .block(Block::default().borders(Borders::ALL));
+fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    // Check if export message should still be shown (5 second timeout)
+    let show_export_msg = app.export_msg.is_some()
+        && app
+            .export_msg_time
+            .map(|t| t.elapsed() < Duration::from_secs(5))
+            .unwrap_or(false);
+
+    let text = if show_export_msg {
+        app.export_msg.as_ref().unwrap().clone()
+    } else {
+        "Controls: [q]uit | [r]eset | [space] pause | [↑/↓] select | [s] strategy | [a] analysis | [e] export".to_string()
+    };
+
+    let style = if show_export_msg {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+
+    let controls = Paragraph::new(text)
+        .style(style)
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL));
 
     f.render_widget(controls, area);
 }
@@ -480,6 +677,13 @@ fn run_app<B: ratatui::backend::Backend>(
                     KeyCode::Char('r') => app.reset(),
                     KeyCode::Char(' ') => app.toggle_pause(),
                     KeyCode::Char('s') => app.cycle_strategy(),
+                    KeyCode::Char('a') => app.toggle_analysis(),
+                    KeyCode::Char('e') => {
+                        if let Err(e) = app.export_report() {
+                            app.export_msg = Some(format!("Export failed: {}", e));
+                            app.export_msg_time = Some(Instant::now());
+                        }
+                    }
                     KeyCode::Up => {
                         if app.selected_device > 0 {
                             app.selected_device -= 1;
