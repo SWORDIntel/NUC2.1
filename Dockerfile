@@ -16,6 +16,18 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Prepare kernel headers for module builds
+RUN HEADERS_DIR=$(find /usr/src -maxdepth 1 -name "linux-headers-*-common" -type d | head -n1) && \
+    if [ -n "$HEADERS_DIR" ] && [ ! -f "$HEADERS_DIR/include/config/auto.conf" ]; then \
+        cd "$HEADERS_DIR" && \
+        make defconfig && \
+        make modules_prepare && \
+        cd -; \
+    fi && \
+    KERNEL_VERSION=$(uname -r) && \
+    mkdir -p /lib/modules/$KERNEL_VERSION && \
+    ln -sf "$HEADERS_DIR" /lib/modules/$KERNEL_VERSION/build
+
 # Copy kernel driver source
 WORKDIR /build/kernel
 COPY movidius_x_vpu.c .
@@ -28,10 +40,11 @@ RUN make clean && make
 # Stage 2: Rust build environment
 FROM rust:1.75-slim AS rust-builder
 
-# Install system dependencies
+# Install system dependencies for Rust build
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    liburing-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Rust workspace
