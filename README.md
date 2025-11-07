@@ -11,10 +11,12 @@ High-performance Linux kernel driver and Rust NCAPI v2 implementation for Intel 
 ### Prerequisites
 
 **System Requirements:**
-- Linux kernel >= 5.12 (required for io_uring support)
-- Rust >= 1.70 (for Rust components)
-- Kernel headers for your running kernel
-- GCC and Make
+- **Linux kernel >= 5.12** (required for io_uring support)
+  - Ubuntu 22.04+ (kernel 5.15+) ✓
+  - Debian Bookworm 12+ (kernel 6.1.x/6.17+) ✓
+- **Rust >= 1.70** (for Rust components)
+- **Kernel headers** for your running kernel
+- **GCC and Make**
 
 **Install Rust (if not already installed):**
 ```bash
@@ -30,6 +32,7 @@ cargo --version
 
 #### Option 1: Docker (Recommended for CI/CD)
 
+**Ubuntu Build:**
 ```bash
 # Clone the repository
 git clone https://github.com/SWORDIntel/NUC2.1
@@ -41,11 +44,16 @@ docker-compose up builder
 # Artifacts will be in ./artifacts/
 ls artifacts/kernel/*.ko
 ls artifacts/bin/movidius-bench
+```
 
-# Or use Docker directly
-docker build -t movidius-nuc21:latest .
-docker run --rm -v $(pwd)/artifacts:/out movidius-nuc21:latest \
-  sh -c "cp -r /opt/movidius/* /out/"
+**Debian Build (6.1.x/6.17+ kernel):**
+```bash
+# Build with Debian Bookworm base
+docker-compose up builder-debian
+
+# Artifacts will be in ./artifacts-debian/
+ls artifacts-debian/kernel/*.ko
+ls artifacts-debian/bin/movidius-bench
 ```
 
 See [`DOCKER.md`](DOCKER.md) for complete Docker documentation.

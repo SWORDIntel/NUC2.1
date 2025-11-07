@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # Build service - compiles everything
+  # Build service - compiles everything (Ubuntu base)
   builder:
     build:
       context: .
@@ -12,6 +12,30 @@ services:
     volumes:
       # Mount output directory for easy artifact extraction
       - ./artifacts:/artifacts:rw
+    command: >
+      sh -c "
+        echo 'Copying artifacts to /artifacts...';
+        mkdir -p /artifacts/kernel /artifacts/bin /artifacts/scripts;
+        cp /opt/movidius/kernel/*.ko /artifacts/kernel/;
+        cp /opt/movidius/bin/* /artifacts/bin/;
+        cp /opt/movidius/scripts/*.sh /artifacts/scripts/;
+        echo 'Artifacts copied successfully!';
+        ls -lah /artifacts/kernel/;
+        ls -lah /artifacts/bin/;
+        cat /opt/movidius/BUILD_INFO
+      "
+
+  # Build service - Debian Bookworm (6.1.x/6.17+ kernel)
+  builder-debian:
+    build:
+      context: .
+      dockerfile: Dockerfile.debian
+      target: final
+    image: movidius-nuc21:debian
+    container_name: movidius-builder-debian
+    volumes:
+      # Mount output directory for easy artifact extraction
+      - ./artifacts-debian:/artifacts:rw
     command: >
       sh -c "
         echo 'Copying artifacts to /artifacts...';
