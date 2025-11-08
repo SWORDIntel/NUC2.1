@@ -27,6 +27,14 @@ RUN echo "Searching for kernel headers..." && \
         exit 1; \
     fi && \
     echo "✓ Using headers: $HEADERS_DIR" && \
+    cd "$HEADERS_DIR" && \
+    (if grep -q "^# CONFIG_MODULES is not set" .config 2>/dev/null || ! grep -q "^CONFIG_MODULES=y" .config 2>/dev/null; then \
+        echo "Enabling CONFIG_MODULES in kernel config..." && \
+        sed -i 's/^# CONFIG_MODULES is not set/CONFIG_MODULES=y/' .config 2>/dev/null || echo "CONFIG_MODULES=y" >> .config && \
+        yes "" | make oldconfig > /dev/null 2>&1 || true && \
+        make modules_prepare || echo "Warning: modules_prepare failed, continuing..."; \
+    fi) && \
+    cd - && \
     KERNEL_VERSION=$(basename "$HEADERS_DIR" | sed 's/linux-headers-//') && \
     echo "✓ Detected kernel version: $KERNEL_VERSION" && \
     mkdir -p /lib/modules/$KERNEL_VERSION && \
