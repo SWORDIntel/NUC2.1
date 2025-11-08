@@ -63,17 +63,6 @@ jobs:
 
           echo "✓ Using kernel headers from: ${HEADERS_DIR}"
 
-          # Prepare kernel headers if needed (creates include/config/auto.conf)
-          cd "${HEADERS_DIR}"
-          if [ ! -f "include/config/auto.conf" ]; then
-            echo "Preparing kernel headers..."
-            # Arch-specific headers should already have proper Makefiles
-            make olddefconfig && make modules_prepare || echo "Warning: Header preparation failed, continuing anyway"
-          else
-            echo "Kernel headers already prepared"
-          fi
-          cd -
-
           # Create symlink for kernel headers
           # Extract version from headers directory instead of uname -r
           # because container kernel != installed headers version
@@ -88,8 +77,6 @@ jobs:
           echo "Build kernel: $(uname -r)"
           echo "Headers version: ${KERNEL_VERSION}"
           echo "Headers path: /lib/modules/${KERNEL_VERSION}/build -> ${HEADERS_DIR}"
-          echo "Checking for auto.conf..."
-          ls -la "${HEADERS_DIR}/include/config/auto.conf" || echo "Warning: auto.conf not found"
 
       - name: Build kernel modules
         run: |
