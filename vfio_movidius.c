@@ -534,7 +534,9 @@ static int vfio_movidius_remove(struct platform_device *pdev)
     struct vfio_movidius_dev *vdev = platform_get_drvdata(pdev);
 
     vfio_unregister_group_dev(&vdev->vdev);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
     vfio_put_device(&vdev->vdev);
+#endif
 
     dev_info(&pdev->dev, "VFIO Movidius driver removed\n");
     return 0;
