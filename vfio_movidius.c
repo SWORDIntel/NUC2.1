@@ -9,6 +9,7 @@
 #include <linux/msi.h>
 #include <linux/eventfd.h>
 #include <linux/interrupt.h>
+#include <linux/version.h>
 
 #define DRIVER_NAME "vfio_movidius"
 #define MOVIDIUS_VFIO_VERSION 1
@@ -97,10 +98,10 @@ static int vfio_movidius_setup_regions(struct vfio_movidius_dev *vdev)
         return -ENOMEM;
     }
 
-    dev_info(&vdev->pdev->dev, "VFIO regions configured: REG=%luKB, MEM=%luMB, MMAP=%luMB\n",
-             MOVIDIUS_REG_SIZE / 1024,
-             MOVIDIUS_MEM_SIZE / (1024 * 1024),
-             MOVIDIUS_MMAP_SIZE / (1024 * 1024));
+    dev_info(&vdev->pdev->dev, "VFIO regions configured: REG=%uKB, MEM=%uMB, MMAP=%uMB\n",
+             (unsigned int)(MOVIDIUS_REG_SIZE / 1024),
+             (unsigned int)(MOVIDIUS_MEM_SIZE / (1024 * 1024)),
+             (unsigned int)(MOVIDIUS_MMAP_SIZE / (1024 * 1024)));
 
     return 0;
 }
@@ -501,7 +502,13 @@ static int vfio_movidius_probe(struct platform_device *pdev)
     mutex_init(&vdev->igate);
 
     vfio_dev = &vdev->vdev;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
     vfio_init_group_dev(vfio_dev, &pdev->dev, &vfio_movidius_ops);
+#else
+    /* Kernel 6.0+ uses a different initialization approach */
+    vfio_dev->dev = &pdev->dev;
+    vfio_dev->ops = &vfio_movidius_ops;
+#endif
 
     ret = vfio_register_group_dev(vfio_dev);
     if (ret) {
