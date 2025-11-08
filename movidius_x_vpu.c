@@ -23,12 +23,18 @@
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
 
-/* io_uring_cmd support - provides async zero-copy inference submission
- * To enable: build kernel with CONFIG_IO_URING=y
- * Falls back to ioctl if not available (e.g., cloud/minimal kernels) */
-
-/* Only try to include io_uring if kernel config has it enabled */
-#if defined(CONFIG_IO_URING) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+/* io_uring_cmd support - DISABLED
+ *
+ * While io_uring provides excellent async performance, too many kernel
+ * configurations have incomplete/broken io_uring support (CONFIG_IO_URING
+ * defined but headers missing symbols). This causes build failures.
+ *
+ * The ioctl interface provides identical functionality with only slightly
+ * higher syscall overhead. For production use with full kernel configs,
+ * you can enable io_uring by changing the #if 0 below to check your
+ * specific kernel config requirements.
+ */
+#if 0
 #include <linux/io_uring.h>
 #define HAS_URING_CMD 1
 #endif
