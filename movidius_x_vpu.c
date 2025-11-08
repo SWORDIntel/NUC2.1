@@ -23,8 +23,9 @@
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
 
-/* io_uring_cmd support was added in kernel 5.19 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
+/* io_uring_cmd support disabled - incomplete header support in most kernels
+ * The ioctl interface provides all the same functionality */
+#if 0 && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
 #include <linux/io_uring.h>
 #define HAS_URING_CMD 1
 #else

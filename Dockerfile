@@ -28,21 +28,18 @@ RUN echo "Searching for kernel headers..." && \
     fi && \
     echo "✓ Using headers: $HEADERS_DIR" && \
     cd "$HEADERS_DIR" && \
-    echo "Generating kernel configuration files..." && \
-    (make olddefconfig > /dev/null 2>&1 || true) && \
-    (if grep -q "^# CONFIG_MODULES is not set" .config 2>/dev/null || ! grep -q "^CONFIG_MODULES=y" .config 2>/dev/null; then \
+    if grep -q "^# CONFIG_MODULES is not set" .config 2>/dev/null || ! grep -q "^CONFIG_MODULES=y" .config 2>/dev/null; then \
         echo "Enabling CONFIG_MODULES in kernel config..." && \
-        sed -i 's/^# CONFIG_MODULES is not set/CONFIG_MODULES=y/' .config 2>/dev/null || echo "CONFIG_MODULES=y" >> .config && \
-        make olddefconfig > /dev/null 2>&1 || true; \
-    fi) && \
-    echo "Preparing kernel headers for module builds..." && \
-    (make prepare || echo "Warning: make prepare had issues, continuing...") && \
-    cd - && \
+        sed -i 's/^# CONFIG_MODULES is not set/CONFIG_MODULES=y/' .config 2>/dev/null || echo "CONFIG_MODULES=y" >> .config; \
+    fi && \
+    echo "Generating kernel configuration..." && \
+    yes "" | make olddefconfig > /dev/null 2>&1 && \
+    echo "Preparing kernel build system..." && \
+    make prepare && \
     KERNEL_VERSION=$(basename "$HEADERS_DIR" | sed 's/linux-headers-//') && \
-    echo "✓ Detected kernel version: $KERNEL_VERSION" && \
     mkdir -p /lib/modules/$KERNEL_VERSION && \
     ln -sf "$HEADERS_DIR" /lib/modules/$KERNEL_VERSION/build && \
-    echo "✓ Headers ready at: $HEADERS_DIR"
+    echo "✓ Kernel headers ready at: $HEADERS_DIR"
 
 # Copy kernel driver source
 WORKDIR /build/kernel
