@@ -331,7 +331,8 @@ static int register_dma_arena(struct movidius_x_vpu_dev *dev, struct movidius_dm
 
     mutex_unlock(&dev->arena_mutex);
     dev_info(dev->dev, "DMA arena registered: addr=0x%llx len=%llu pages=%lu\n",
-             arena_info->addr, arena_info->len, num_pages);
+             (unsigned long long)arena_info->addr, (unsigned long long)arena_info->len,
+             (unsigned long)num_pages);
     return 0;
 }
 
