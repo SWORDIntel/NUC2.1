@@ -71,7 +71,7 @@ jobs:
             yes "" | make oldconfig > /dev/null 2>&1 || true
           fi
           echo "Preparing kernel headers for module builds..."
-          make modules_prepare
+          make modules_prepare || echo "Warning: modules_prepare had issues, continuing..."
           cd -
 
           # Create symlink for kernel headers

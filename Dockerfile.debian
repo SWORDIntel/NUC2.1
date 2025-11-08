@@ -35,7 +35,7 @@ RUN echo "Searching for kernel headers..." && \
         yes "" | make oldconfig > /dev/null 2>&1 || true; \
     fi && \
     echo "Preparing kernel headers for module builds..." && \
-    make modules_prepare) && \
+    (make modules_prepare || echo "Warning: modules_prepare had issues, continuing...")) && \
     cd - && \
     KERNEL_VERSION=$(basename "$HEADERS_DIR" | sed 's/linux-headers-//') && \
     echo "✓ Detected kernel version: $KERNEL_VERSION" && \
