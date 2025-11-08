@@ -74,24 +74,37 @@ jobs:
           fi
           cd -
 
-          # Create symlink for current kernel if needed
-          KERNEL_VERSION=$(uname -r)
+          # Create symlink for kernel headers
+          # Extract version from headers directory instead of uname -r
+          # because container kernel != installed headers version
+          KERNEL_VERSION=$(basename "${HEADERS_DIR}" | sed 's/linux-headers-//')
+          echo "✓ Detected kernel version from headers: $KERNEL_VERSION"
+
           if [ ! -d "/lib/modules/${KERNEL_VERSION}/build" ]; then
             mkdir -p "/lib/modules/${KERNEL_VERSION}"
             ln -sf "${HEADERS_DIR}" "/lib/modules/${KERNEL_VERSION}/build"
           fi
 
           echo "Build kernel: $(uname -r)"
-          echo "Headers path: /lib/modules/$(uname -r)/build -> ${HEADERS_DIR}"
+          echo "Headers version: ${KERNEL_VERSION}"
+          echo "Headers path: /lib/modules/${KERNEL_VERSION}/build -> ${HEADERS_DIR}"
           echo "Checking for auto.conf..."
           ls -la "${HEADERS_DIR}/include/config/auto.conf" || echo "Warning: auto.conf not found"
 
       - name: Build kernel modules
         run: |
-          echo "Building with kernel: $(uname -r)"
-          echo "Kernel headers: /lib/modules/$(uname -r)/build"
+          # Use the kernel version from installed headers, not running kernel
+          HEADERS_DIR=$(ls -1d /usr/src/linux-headers-* 2>/dev/null | grep -v '\-common$' | head -n1)
+          KERNEL_VERSION=$(basename "${HEADERS_DIR}" | sed 's/linux-headers-//')
+
+          echo "Building with headers version: ${KERNEL_VERSION}"
+          echo "Running kernel: $(uname -r)"
+          echo "Kernel headers: /lib/modules/${KERNEL_VERSION}/build"
           echo "OS: ${{ matrix.os }}"
-          make clean && make
+
+          # Pass KDIR to both clean and build steps
+          export KDIR="/lib/modules/${KERNEL_VERSION}/build"
+          make clean KDIR="${KDIR}" && make KDIR="${KDIR}"
 
       - name: Verify kernel modules
         run: |

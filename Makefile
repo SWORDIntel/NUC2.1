@@ -1,7 +1,7 @@
 # Makefile for Movidius Myriad X VPU driver
 # Version: 2.0
 
-KDIR := /lib/modules/$(shell uname -r)/build
+KDIR ?= /lib/modules/$(shell uname -r)/build
 
 obj-m += movidius_x_vpu.o
 obj-m += vfio_movidius.o
