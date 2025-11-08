@@ -50,7 +50,7 @@ RUN HEADERS_DIR=$(ls -1d /usr/src/linux-headers-* 2>/dev/null | grep -v '\-commo
     KERNEL_VERSION=$(basename "$HEADERS_DIR" | sed 's/linux-headers-//') && \
     export KDIR="/lib/modules/$KERNEL_VERSION/build" && \
     echo "Building modules with KDIR=$KDIR" && \
-    make clean && make KDIR="$KDIR"
+    make clean KDIR="$KDIR" && make KDIR="$KDIR"
 
 # Stage 2: Rust build environment
 FROM rust:1.83-slim AS rust-builder

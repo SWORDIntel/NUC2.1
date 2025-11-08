@@ -102,9 +102,9 @@ jobs:
           echo "Kernel headers: /lib/modules/${KERNEL_VERSION}/build"
           echo "OS: ${{ matrix.os }}"
 
-          # Update KDIR in Makefile to use the correct headers version
+          # Pass KDIR to both clean and build steps
           export KDIR="/lib/modules/${KERNEL_VERSION}/build"
-          make clean && make KDIR="${KDIR}"
+          make clean KDIR="${KDIR}" && make KDIR="${KDIR}"
 
       - name: Verify kernel modules
         run: |
