@@ -69,8 +69,9 @@ jobs:
             echo "Enabling CONFIG_MODULES in kernel config..."
             sed -i 's/^# CONFIG_MODULES is not set/CONFIG_MODULES=y/' .config 2>/dev/null || echo "CONFIG_MODULES=y" >> .config
             yes "" | make oldconfig > /dev/null 2>&1 || true
-            make modules_prepare || echo "Warning: modules_prepare failed, continuing..."
           fi
+          echo "Preparing kernel headers for module builds..."
+          make modules_prepare
           cd -
 
           # Create symlink for kernel headers
