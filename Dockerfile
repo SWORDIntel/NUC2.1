@@ -45,7 +45,12 @@ COPY vfio_movidius.c .
 COPY Makefile .
 
 # Build kernel modules
-RUN make clean && make
+# Set KDIR to use the installed headers version, not the running kernel
+RUN HEADERS_DIR=$(ls -1d /usr/src/linux-headers-* 2>/dev/null | grep -v '\-common$' | head -n1) && \
+    KERNEL_VERSION=$(basename "$HEADERS_DIR" | sed 's/linux-headers-//') && \
+    export KDIR="/lib/modules/$KERNEL_VERSION/build" && \
+    echo "Building modules with KDIR=$KDIR" && \
+    make clean && make KDIR="$KDIR"
 
 # Stage 2: Rust build environment
 FROM rust:1.83-slim AS rust-builder
