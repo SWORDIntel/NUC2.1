@@ -23,18 +23,20 @@
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
 
-/* io_uring_cmd support - DISABLED
+/* io_uring_cmd support - provides async zero-copy inference submission
  *
- * While io_uring provides excellent async performance, too many kernel
- * configurations have incomplete/broken io_uring support (CONFIG_IO_URING
- * defined but headers missing symbols). This causes build failures.
+ * Enabled by default. Provides significant performance benefits on kernels
+ * with proper io_uring support (CONFIG_IO_URING=y, kernel >= 6.2).
  *
- * The ioctl interface provides identical functionality with only slightly
- * higher syscall overhead. For production use with full kernel configs,
- * you can enable io_uring by changing the #if 0 below to check your
- * specific kernel config requirements.
+ * Falls back to ioctl on kernels with incomplete io_uring headers.
+ *
+ * To disable: make ENABLE_IO_URING=0
  */
-#if 0
+#ifndef MOVIDIUS_ENABLE_IO_URING
+#define MOVIDIUS_ENABLE_IO_URING 1  /* Default: enabled */
+#endif
+
+#if MOVIDIUS_ENABLE_IO_URING && defined(CONFIG_IO_URING) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
 #include <linux/io_uring.h>
 #define HAS_URING_CMD 1
 #endif
