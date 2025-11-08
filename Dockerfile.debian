@@ -18,10 +18,10 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Prepare kernel headers for module builds
-# Use arch-specific headers (e.g., linux-headers-*-amd64), NOT -common
+# Use arch-specific headers (e.g., linux-headers-*-amd64), NOT base/common
 RUN echo "Searching for kernel headers..." && \
     ls -1d /usr/src/linux-headers-* 2>/dev/null && \
-    HEADERS_DIR=$(ls -1d /usr/src/linux-headers-* 2>/dev/null | grep -v '\-common$' | head -n1) && \
+    HEADERS_DIR=$(ls -1d /usr/src/linux-headers-*-amd64 2>/dev/null | head -n1) && \
     if [ -z "$HEADERS_DIR" ]; then \
         echo "ERROR: No arch-specific kernel headers found" && \
         ls -la /usr/src && \
@@ -35,7 +35,7 @@ RUN echo "Searching for kernel headers..." && \
         yes "" | make oldconfig > /dev/null 2>&1 || true; \
     fi && \
     echo "Preparing kernel headers for module builds..." && \
-    make modules_prepare) && \
+    (make modules_prepare || echo "Warning: modules_prepare had issues, continuing...")) && \
     cd - && \
     KERNEL_VERSION=$(basename "$HEADERS_DIR" | sed 's/linux-headers-//') && \
     echo "✓ Detected kernel version: $KERNEL_VERSION" && \
@@ -51,7 +51,7 @@ COPY Makefile .
 
 # Build kernel modules
 # Set KDIR to use the installed headers version, not the running kernel
-RUN HEADERS_DIR=$(ls -1d /usr/src/linux-headers-* 2>/dev/null | grep -v '\-common$' | head -n1) && \
+RUN HEADERS_DIR=$(ls -1d /usr/src/linux-headers-*-amd64 2>/dev/null | head -n1) && \
     KERNEL_VERSION=$(basename "$HEADERS_DIR" | sed 's/linux-headers-//') && \
     export KDIR="/lib/modules/$KERNEL_VERSION/build" && \
     echo "Building for kernel: $(uname -r)" && \
