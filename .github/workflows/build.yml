@@ -14,15 +14,8 @@ env:
 jobs:
   # Job 1: Build kernel driver
   build-kernel:
-    name: Build Kernel Driver (${{ matrix.os }})
+    name: Build Kernel Driver
     runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        os: [ubuntu-22.04, debian-12]
-
-    container:
-      image: ${{ matrix.os == 'debian-12' && 'debian:bookworm' || 'ubuntu:22.04' }}
-      options: --privileged
 
     steps:
       - name: Checkout code
@@ -30,79 +23,27 @@ jobs:
 
       - name: Install kernel build dependencies
         run: |
-          apt-get update
-
-          # Install build tools first
-          apt-get install -y \
+          sudo apt-get update
+          sudo apt-get install -y \
             build-essential \
+            linux-headers-$(uname -r) \
             kmod \
             libelf-dev \
             bc \
             flex \
             bison \
-            libssl-dev \
-            git
+            libssl-dev
 
-          # Install generic kernel headers (GitHub Actions uses Azure kernels not in repos)
-          # We're cross-compiling, not loading modules, so generic headers are fine
-          apt-get install -y linux-headers-generic || apt-get install -y linux-headers-amd64 || true
-
-          # Find arch-specific kernel headers (e.g., -generic for Ubuntu, -amd64 for Debian)
-          # NOT the base/common directory which doesn't have build configuration
-          echo "Searching for arch-specific kernel headers..."
-          ls -1d /usr/src/linux-headers-* 2>/dev/null || true
-
-          HEADERS_DIR=$(ls -1d /usr/src/linux-headers-*-generic /usr/src/linux-headers-*-amd64 2>/dev/null | head -n1)
-
-          if [ -z "$HEADERS_DIR" ]; then
-            echo "ERROR: No arch-specific kernel headers found"
-            echo "Available directories in /usr/src:"
-            ls -la /usr/src
-            exit 1
-          fi
-
-          echo "✓ Using kernel headers from: ${HEADERS_DIR}"
-
-          # Enable CONFIG_MODULES if disabled
-          cd "${HEADERS_DIR}"
-          if grep -q "^# CONFIG_MODULES is not set" .config 2>/dev/null || ! grep -q "^CONFIG_MODULES=y" .config 2>/dev/null; then
-            echo "Enabling CONFIG_MODULES in kernel config..."
-            sed -i 's/^# CONFIG_MODULES is not set/CONFIG_MODULES=y/' .config 2>/dev/null || echo "CONFIG_MODULES=y" >> .config
-            yes "" | make oldconfig > /dev/null 2>&1 || true
-          fi
-          echo "Preparing kernel headers for module builds..."
-          make modules_prepare || echo "Warning: modules_prepare had issues, continuing..."
-          cd -
-
-          # Create symlink for kernel headers
-          # Extract version from headers directory instead of uname -r
-          # because container kernel != installed headers version
-          KERNEL_VERSION=$(basename "${HEADERS_DIR}" | sed 's/linux-headers-//')
-          echo "✓ Detected kernel version from headers: $KERNEL_VERSION"
-
-          if [ ! -d "/lib/modules/${KERNEL_VERSION}/build" ]; then
-            mkdir -p "/lib/modules/${KERNEL_VERSION}"
-            ln -sf "${HEADERS_DIR}" "/lib/modules/${KERNEL_VERSION}/build"
-          fi
-
-          echo "Build kernel: $(uname -r)"
-          echo "Headers version: ${KERNEL_VERSION}"
-          echo "Headers path: /lib/modules/${KERNEL_VERSION}/build -> ${HEADERS_DIR}"
+      - name: Verify kernel headers
+        run: |
+          echo "Building for kernel: $(uname -r)"
+          echo "Kernel headers: /lib/modules/$(uname -r)/build"
+          ls -la /lib/modules/$(uname -r)/build || exit 1
 
       - name: Build kernel modules
         run: |
-          # Use the kernel version from installed headers, not running kernel
-          HEADERS_DIR=$(ls -1d /usr/src/linux-headers-* 2>/dev/null | grep -v '\-common$' | head -n1)
-          KERNEL_VERSION=$(basename "${HEADERS_DIR}" | sed 's/linux-headers-//')
-
-          echo "Building with headers version: ${KERNEL_VERSION}"
-          echo "Running kernel: $(uname -r)"
-          echo "Kernel headers: /lib/modules/${KERNEL_VERSION}/build"
-          echo "OS: ${{ matrix.os }}"
-
-          # Pass KDIR to both clean and build steps
-          export KDIR="/lib/modules/${KERNEL_VERSION}/build"
-          make clean KDIR="${KDIR}" && make KDIR="${KDIR}"
+          make clean
+          make
 
       - name: Verify kernel modules
         run: |
@@ -114,7 +55,7 @@ jobs:
       - name: Upload kernel modules
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-modules-${{ matrix.os }}
+          name: kernel-modules
           path: |
             movidius_x_vpu.ko
             vfio_movidius.ko
@@ -185,10 +126,18 @@ jobs:
             movidius-rs/target/release/libmovidius_ncapi.*
           retention-days: 30
 
-  # Job 3: Docker build and push
+  # Job 3: Docker build and test
+  # Tests that Dockerfiles work for Ubuntu and Debian
   build-docker:
-    name: Build Docker Image
+    name: Build Docker Image (${{ matrix.dockerfile }})
     runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - dockerfile: Dockerfile
+            tag: ubuntu
+          - dockerfile: Dockerfile.debian
+            tag: debian
     permissions:
       contents: read
       packages: write
@@ -200,8 +149,23 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: movidius-test:${{ matrix.tag }}
+          cache-from: type=gha,scope=${{ matrix.tag }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.tag }}
+
+      - name: Test Docker image
+        run: |
+          docker run --rm movidius-test:${{ matrix.tag }} ls -la /opt/movidius || true
+
       - name: Log in to Container Registry
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && matrix.dockerfile == 'Dockerfile'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -209,6 +173,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
+        if: github.event_name != 'pull_request' && matrix.dockerfile == 'Dockerfile'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -221,32 +186,17 @@ jobs:
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: false
-          load: true
-          tags: movidius-test:latest
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Test Docker image
-        run: |
-          docker run --rm movidius-test:latest
-          docker run --rm movidius-test:latest ls -la /opt/movidius
-
       - name: Push Docker image
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && matrix.dockerfile == 'Dockerfile'
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.tag }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.tag }}
 
   # Job 4: Integration test
   integration-test:

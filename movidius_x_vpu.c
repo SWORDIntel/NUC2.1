@@ -5,7 +5,6 @@
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/uaccess.h>
-#include <linux/io_uring.h>
 #include <linux/moduleparam.h>
 #include <linux/interrupt.h>
 #include <linux/scatterlist.h>
@@ -24,8 +23,13 @@
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
-#error "movidius_x_vpu needs >= 5.12 for io_uring_cmd"
+/* io_uring_cmd support was added in kernel 5.19 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
+#include <linux/io_uring.h>
+#define HAS_URING_CMD 1
+#else
+/* Forward declaration for pointer type when io_uring not available */
+struct io_uring_cmd;
 #endif
 
 #define DRIVER_NAME "movidius_x_vpu"
@@ -120,7 +124,9 @@ MODULE_PARM_DESC(submission_cpu_affinity, "CPU core for submission thread (-1 = 
 /* Forward declarations */
 static int movidius_platform_probe(struct platform_device *pdev);
 static int movidius_platform_remove(struct platform_device *pdev);
+#ifdef HAS_URING_CMD
 static int movidius_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags);
+#endif
 static long movidius_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 static int movidius_open(struct inode *inode, struct file *file);
 static int movidius_release(struct inode *inode, struct file *file);
@@ -260,7 +266,9 @@ static const struct file_operations movidius_fops = {
     .owner = THIS_MODULE,
     .open = movidius_open,
     .release = movidius_release,
+#ifdef HAS_URING_CMD
     .uring_cmd = movidius_uring_cmd,
+#endif
     .unlocked_ioctl = movidius_ioctl,
 };
 
@@ -617,7 +625,9 @@ static void urb_complete_callback(struct urb *urb)
 
     /* Complete io_uring command */
     if (cmd) {
+#ifdef HAS_URING_CMD
         io_uring_cmd_done(cmd, result, 0, 0);
+#endif
     }
 
     /* Return URB to pool */
@@ -845,7 +855,11 @@ static int submission_kthread(void *data)
             int ret = submit_inference_request(dev, &req->req, req->cmd);
             if (ret) {
                 /* On error, complete with error code */
-                io_uring_cmd_done(req->cmd, ret, 0, 0);
+#ifdef HAS_URING_CMD
+                if (req->cmd) {
+                    io_uring_cmd_done(req->cmd, ret, 0, 0);
+                }
+#endif
             }
             list_del(&req->list);
             kfree(req);
@@ -861,6 +875,7 @@ static int submission_kthread(void *data)
 
 /* ========== io_uring Command Interface ========== */
 
+#ifdef HAS_URING_CMD
 static int movidius_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 {
     struct file *file = cmd->file;
@@ -956,6 +971,7 @@ static int movidius_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags
 
     return ret;
 }
+#endif /* HAS_URING_CMD */
 
 /* ========== IOCTL Interface ========== */
 
