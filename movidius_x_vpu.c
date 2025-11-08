@@ -24,17 +24,13 @@
 #include <linux/kobject.h>
 
 /* io_uring_cmd support - provides async zero-copy inference submission
- * To enable: build kernel with CONFIG_IO_URING=y and CONFIG_IO_URING_CMD=y
- * Falls back to ioctl if not available */
+ * To enable: build kernel with CONFIG_IO_URING=y
+ * Falls back to ioctl if not available (e.g., cloud/minimal kernels) */
 
-/* Attempt to use io_uring - will fail gracefully if not supported */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+/* Only try to include io_uring if kernel config has it enabled */
+#if defined(CONFIG_IO_URING) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 #include <linux/io_uring.h>
-
-/* Test if we have the actual symbols by trying to use them in a conditional */
-#if IS_ENABLED(CONFIG_IO_URING)
 #define HAS_URING_CMD 1
-#endif
 #endif
 
 #ifndef HAS_URING_CMD
