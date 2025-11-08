@@ -5,7 +5,6 @@
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/uaccess.h>
-#include <linux/io_uring.h>
 #include <linux/moduleparam.h>
 #include <linux/interrupt.h>
 #include <linux/scatterlist.h>
@@ -26,7 +25,11 @@
 
 /* io_uring_cmd support was added in kernel 5.19 */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
+#include <linux/io_uring.h>
 #define HAS_URING_CMD 1
+#else
+/* Forward declaration for pointer type when io_uring not available */
+struct io_uring_cmd;
 #endif
 
 #define DRIVER_NAME "movidius_x_vpu"
@@ -622,7 +625,9 @@ static void urb_complete_callback(struct urb *urb)
 
     /* Complete io_uring command */
     if (cmd) {
+#ifdef HAS_URING_CMD
         io_uring_cmd_done(cmd, result, 0, 0);
+#endif
     }
 
     /* Return URB to pool */
@@ -850,7 +855,11 @@ static int submission_kthread(void *data)
             int ret = submit_inference_request(dev, &req->req, req->cmd);
             if (ret) {
                 /* On error, complete with error code */
-                io_uring_cmd_done(req->cmd, ret, 0, 0);
+#ifdef HAS_URING_CMD
+                if (req->cmd) {
+                    io_uring_cmd_done(req->cmd, ret, 0, 0);
+                }
+#endif
             }
             list_del(&req->list);
             kfree(req);
