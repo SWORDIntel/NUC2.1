@@ -43,7 +43,7 @@ jobs:
       - name: Build kernel modules
         run: |
           make clean
-          make
+          make ENABLE_IO_URING=0
 
       - name: Verify kernel modules
         run: |

@@ -3,6 +3,12 @@
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
+# Enable io_uring for async performance (set to 0 to disable)
+ENABLE_IO_URING ?= 1
+
+# Add compiler flags
+ccflags-y := -DMOVIDIUS_ENABLE_IO_URING=$(ENABLE_IO_URING)
+
 obj-m += movidius_x_vpu.o
 obj-m += vfio_movidius.o
 
