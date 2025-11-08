@@ -248,14 +248,5 @@ mod tests {
         assert_eq!(converted[3], f32::NEG_INFINITY);
     }
 
-    #[cfg(feature = "bench")]
-    #[bench]
-    fn bench_fp32_to_fp16(b: &mut test::Bencher) {
-        let data = vec![1.0f32; 10000];
-        let mut output = vec![f16::ZERO; 10000];
-        b.iter(|| {
-            fp32_to_fp16(&data, &mut output);
-            test::black_box(&output);
-        });
-    }
+    // Benchmarks are in benches/tensor_ops.rs using criterion
 }

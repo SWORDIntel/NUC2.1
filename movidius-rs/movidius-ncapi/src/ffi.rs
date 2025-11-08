@@ -7,16 +7,31 @@ use std::ptr;
 use std::sync::Arc;
 
 // Opaque handle types for C
+/// Opaque handle for a Movidius Neural Compute device.
+///
+/// This is an opaque C-compatible type used in the FFI layer to represent a device handle.
+/// It should only be created and manipulated through the nc* FFI functions.
 #[repr(C)]
 pub struct ncDeviceHandle_t {
     _private: [u8; 0],
 }
 
+/// Opaque handle for a neural network graph.
+///
+/// This is an opaque C-compatible type used in the FFI layer to represent a graph handle.
+/// Graphs contain the neural network model that can be allocated on a device and executed.
+/// It should only be created and manipulated through the nc* FFI functions.
 #[repr(C)]
 pub struct ncGraphHandle_t {
     _private: [u8; 0],
 }
 
+/// Opaque handle for a FIFO (First-In-First-Out) queue.
+///
+/// This is an opaque C-compatible type used in the FFI layer to represent a FIFO handle.
+/// FIFOs are used to pass input data to graphs and receive output data from them.
+/// They can be either host-readable (for outputs) or host-writable (for inputs).
+/// It should only be created and manipulated through the nc* FFI functions.
 #[repr(C)]
 pub struct ncFifoHandle_t {
     _private: [u8; 0],
@@ -30,12 +45,12 @@ struct DeviceHandleWrapper {
 
 struct GraphHandleWrapper {
     graph: Arc<RwLock<Graph>>,
-    ref_count: std::sync::atomic::AtomicUsize,
+    _ref_count: std::sync::atomic::AtomicUsize,
 }
 
 struct FifoHandleWrapper {
     fifo: Arc<RwLock<Fifo>>,
-    ref_count: std::sync::atomic::AtomicUsize,
+    _ref_count: std::sync::atomic::AtomicUsize,
 }
 
 // Safe conversion functions
@@ -60,7 +75,7 @@ unsafe fn c_to_device(ptr: *mut ncDeviceHandle_t) -> Result<Arc<RwLock<Device>>>
 fn graph_to_c(graph: Arc<RwLock<Graph>>) -> *mut ncGraphHandle_t {
     Box::into_raw(Box::new(GraphHandleWrapper {
         graph,
-        ref_count: std::sync::atomic::AtomicUsize::new(1),
+        _ref_count: std::sync::atomic::AtomicUsize::new(1),
     })) as *mut ncGraphHandle_t
 }
 
@@ -77,7 +92,7 @@ unsafe fn c_to_graph(ptr: *mut ncGraphHandle_t) -> Result<Arc<RwLock<Graph>>> {
 fn fifo_to_c(fifo: Arc<RwLock<Fifo>>) -> *mut ncFifoHandle_t {
     Box::into_raw(Box::new(FifoHandleWrapper {
         fifo,
-        ref_count: std::sync::atomic::AtomicUsize::new(1),
+        _ref_count: std::sync::atomic::AtomicUsize::new(1),
     })) as *mut ncFifoHandle_t
 }
 
@@ -179,8 +194,8 @@ pub unsafe extern "C" fn ncDeviceDestroy(device_handle: *mut *mut ncDeviceHandle
 #[no_mangle]
 pub unsafe extern "C" fn ncDeviceGetOption(
     device_handle: *mut ncDeviceHandle_t,
-    option: c_int,
-    data: *mut c_void,
+    _option: c_int,
+    _data: *mut c_void,
     data_length: *mut c_uint,
 ) -> c_int {
     if data_length.is_null() {
@@ -529,6 +544,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "Requires actual hardware device"]
     fn test_handle_conversions() {
         let device = Device::create(0).unwrap();
         let c_handle = device_to_c(device.clone());
