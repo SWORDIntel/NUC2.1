@@ -544,6 +544,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "Requires actual hardware device"]
     fn test_handle_conversions() {
         let device = Device::create(0).unwrap();
         let c_handle = device_to_c(device.clone());
