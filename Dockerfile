@@ -30,7 +30,7 @@ RUN echo "Searching for kernel headers..." && \
     cd "$HEADERS_DIR" && \
     if [ ! -f "include/config/auto.conf" ]; then \
         echo "Preparing kernel headers..." && \
-        make oldconfig && \
+        make olddefconfig && \
         make modules_prepare; \
     fi && \
     KERNEL_VERSION=$(basename "$HEADERS_DIR" | sed 's/linux-headers-//') && \
