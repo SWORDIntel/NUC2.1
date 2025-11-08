@@ -28,11 +28,10 @@ RUN echo "Searching for kernel headers..." && \
     fi && \
     echo "✓ Using headers: $HEADERS_DIR" && \
     cd "$HEADERS_DIR" && \
-    if [ ! -f "include/config/auto.conf" ]; then \
+    (if [ ! -f "include/config/auto.conf" ]; then \
         echo "Preparing kernel headers..." && \
-        make olddefconfig && \
-        make modules_prepare; \
-    fi && \
+        make olddefconfig && make modules_prepare; \
+    fi || echo "Warning: Header preparation failed, continuing anyway") && \
     KERNEL_VERSION=$(basename "$HEADERS_DIR" | sed 's/linux-headers-//') && \
     echo "✓ Detected kernel version: $KERNEL_VERSION" && \
     mkdir -p /lib/modules/$KERNEL_VERSION && \

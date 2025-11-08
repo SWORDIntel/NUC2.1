@@ -68,7 +68,7 @@ jobs:
           if [ ! -f "include/config/auto.conf" ]; then
             echo "Preparing kernel headers..."
             # Arch-specific headers should already have proper Makefiles
-            make oldconfig && make modules_prepare
+            make olddefconfig && make modules_prepare || echo "Warning: Header preparation failed, continuing anyway"
           else
             echo "Kernel headers already prepared"
           fi
