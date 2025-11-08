@@ -23,12 +23,17 @@
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
 
-/* io_uring_cmd support disabled - incomplete header support in most kernels
- * The ioctl interface provides all the same functionality */
-#if 0 && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
+/* io_uring_cmd support - provides async zero-copy inference submission
+ * To enable: build kernel with CONFIG_IO_URING=y
+ * Falls back to ioctl if not available (e.g., cloud/minimal kernels) */
+
+/* Only try to include io_uring if kernel config has it enabled */
+#if defined(CONFIG_IO_URING) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 #include <linux/io_uring.h>
 #define HAS_URING_CMD 1
-#else
+#endif
+
+#ifndef HAS_URING_CMD
 /* Forward declaration for pointer type when io_uring not available */
 struct io_uring_cmd;
 #endif
