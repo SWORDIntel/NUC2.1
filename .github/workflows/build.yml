@@ -47,12 +47,12 @@ jobs:
           # We're cross-compiling, not loading modules, so generic headers are fine
           apt-get install -y linux-headers-generic || apt-get install -y linux-headers-amd64 || true
 
-          # Find arch-specific kernel headers (NOT -common, that's just shared files)
-          # Explicitly exclude -common directories which only contain shared headers
+          # Find arch-specific kernel headers (e.g., -generic for Ubuntu, -amd64 for Debian)
+          # NOT the base/common directory which doesn't have build configuration
           echo "Searching for arch-specific kernel headers..."
           ls -1d /usr/src/linux-headers-* 2>/dev/null || true
 
-          HEADERS_DIR=$(ls -1d /usr/src/linux-headers-* 2>/dev/null | grep -v '\-common$' | head -n1)
+          HEADERS_DIR=$(ls -1d /usr/src/linux-headers-*-generic /usr/src/linux-headers-*-amd64 2>/dev/null | head -n1)
 
           if [ -z "$HEADERS_DIR" ]; then
             echo "ERROR: No arch-specific kernel headers found"

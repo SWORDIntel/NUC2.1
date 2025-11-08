@@ -17,10 +17,10 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Prepare kernel headers for module builds
-# Use arch-specific headers (e.g., linux-headers-*-generic), NOT -common
+# Use arch-specific headers (e.g., linux-headers-*-generic), NOT base/common
 RUN echo "Searching for kernel headers..." && \
     ls -1d /usr/src/linux-headers-* 2>/dev/null && \
-    HEADERS_DIR=$(ls -1d /usr/src/linux-headers-* 2>/dev/null | grep -v '\-common$' | head -n1) && \
+    HEADERS_DIR=$(ls -1d /usr/src/linux-headers-*-generic 2>/dev/null | head -n1) && \
     if [ -z "$HEADERS_DIR" ]; then \
         echo "ERROR: No arch-specific kernel headers found" && \
         ls -la /usr/src && \
@@ -28,13 +28,15 @@ RUN echo "Searching for kernel headers..." && \
     fi && \
     echo "✓ Using headers: $HEADERS_DIR" && \
     cd "$HEADERS_DIR" && \
+    echo "Generating kernel configuration files..." && \
+    (make olddefconfig > /dev/null 2>&1 || true) && \
     (if grep -q "^# CONFIG_MODULES is not set" .config 2>/dev/null || ! grep -q "^CONFIG_MODULES=y" .config 2>/dev/null; then \
         echo "Enabling CONFIG_MODULES in kernel config..." && \
         sed -i 's/^# CONFIG_MODULES is not set/CONFIG_MODULES=y/' .config 2>/dev/null || echo "CONFIG_MODULES=y" >> .config && \
-        yes "" | make oldconfig > /dev/null 2>&1 || true; \
-    fi && \
+        make olddefconfig > /dev/null 2>&1 || true; \
+    fi) && \
     echo "Preparing kernel headers for module builds..." && \
-    (make modules_prepare || echo "Warning: modules_prepare had issues, continuing...")) && \
+    (make prepare || echo "Warning: make prepare had issues, continuing...") && \
     cd - && \
     KERNEL_VERSION=$(basename "$HEADERS_DIR" | sed 's/linux-headers-//') && \
     echo "✓ Detected kernel version: $KERNEL_VERSION" && \
@@ -50,7 +52,7 @@ COPY Makefile .
 
 # Build kernel modules
 # Set KDIR to use the installed headers version, not the running kernel
-RUN HEADERS_DIR=$(ls -1d /usr/src/linux-headers-* 2>/dev/null | grep -v '\-common$' | head -n1) && \
+RUN HEADERS_DIR=$(ls -1d /usr/src/linux-headers-*-generic 2>/dev/null | head -n1) && \
     KERNEL_VERSION=$(basename "$HEADERS_DIR" | sed 's/linux-headers-//') && \
     export KDIR="/lib/modules/$KERNEL_VERSION/build" && \
     echo "Building modules with KDIR=$KDIR" && \
