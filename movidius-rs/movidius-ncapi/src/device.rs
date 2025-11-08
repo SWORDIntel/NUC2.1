@@ -7,41 +7,62 @@ use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
+/// Represents the current state of a Movidius device
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum DeviceState {
+    /// Device has been created but not yet opened
     Created = 0,
+    /// Device is open and ready for operations
     Opened = 1,
+    /// Device has been closed and is no longer usable
     Closed = 2,
 }
 
+/// Hardware version identifier for Movidius devices
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum DeviceHwVersion {
+    /// Myriad 2 (MA2450) hardware version
     Ma2450 = 2450,
+    /// Myriad X (MA2480) hardware version
     Ma2480 = 2480,
 }
 
+/// Configuration and query options for device properties
 #[derive(Debug, Clone, Copy)]
 pub enum DeviceOption {
+    /// Thermal statistics (temperature readings)
     ThermalStats,
+    /// Current thermal throttling level
     ThrottlingLevel,
+    /// Current state of the device
     DeviceState,
+    /// Amount of memory currently in use
     CurrentMemoryUsed,
+    /// Total available memory size
     MemorySize,
+    /// Maximum number of FIFOs supported
     MaxFifoNum,
+    /// Number of FIFOs currently allocated
     AllocatedFifoNum,
+    /// Maximum number of graphs supported
     MaxGraphNum,
+    /// Number of graphs currently allocated
     AllocatedGraphNum,
+    /// Firmware version information
     FwVersion,
+    /// Device name string
     DeviceName,
+    /// Hardware version identifier
     HwVersion,
 }
 
+/// Handle to a Movidius Neural Compute device
 pub struct Device {
     index: i32,
     state: DeviceState,
-    device_file: Option<File>,
+    _device_file: Option<File>,
     fd: Option<RawFd>,
 }
 
@@ -49,6 +70,13 @@ impl Device {
     /// Maximum supported device index
     const MAX_DEVICE_INDEX: i32 = 32;
 
+    /// Creates a new device handle for the specified device index
+    ///
+    /// # Arguments
+    /// * `index` - Device index (0-31)
+    ///
+    /// # Returns
+    /// An Arc-wrapped, thread-safe device handle in the Created state
     pub fn create(index: i32) -> Result<Arc<RwLock<Self>>> {
         // Validate device index
         if index < 0 {
@@ -78,11 +106,14 @@ impl Device {
         Ok(Arc::new(RwLock::new(Self {
             index,
             state: DeviceState::Created,
-            device_file: Some(device_file),
+            _device_file: Some(device_file),
             fd: Some(fd),
         })))
     }
 
+    /// Opens the device and transitions it to the Opened state
+    ///
+    /// Device must be in Created state. After opening, the device is ready for operations.
     pub fn open(&mut self) -> Result<()> {
         if self.state != DeviceState::Created {
             tracing::error!(
@@ -100,6 +131,9 @@ impl Device {
         Ok(())
     }
 
+    /// Closes the device and transitions it to the Closed state
+    ///
+    /// Device must be in Opened state. After closing, the device can no longer be used.
     pub fn close(&mut self) -> Result<()> {
         if self.state != DeviceState::Opened {
             tracing::error!(
@@ -117,10 +151,18 @@ impl Device {
         Ok(())
     }
 
+    /// Returns the raw file descriptor for the device
+    ///
+    /// # Returns
+    /// `Some(fd)` if device file is open, `None` otherwise
     pub fn fd(&self) -> Option<RawFd> {
         self.fd
     }
 
+    /// Returns the current state of the device
+    ///
+    /// # Returns
+    /// The current `DeviceState` (Created, Opened, or Closed)
     pub fn state(&self) -> DeviceState {
         self.state
     }

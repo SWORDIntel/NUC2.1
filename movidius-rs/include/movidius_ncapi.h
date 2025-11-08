@@ -3,6 +3,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/**
+ * Maximum size for device and graph names
+ */
 #define MAX_NAME_SIZE 28
 
 /**
@@ -88,14 +91,35 @@
  */
 #define TYPICAL_MAX_FIFOS 20
 
+/**
+ * Opaque handle for a Movidius Neural Compute device.
+ *
+ * This is an opaque C-compatible type used in the FFI layer to represent a device handle.
+ * It should only be created and manipulated through the nc* FFI functions.
+ */
 typedef struct ncDeviceHandle_t {
   uint8_t _private[0];
 } ncDeviceHandle_t;
 
+/**
+ * Opaque handle for a neural network graph.
+ *
+ * This is an opaque C-compatible type used in the FFI layer to represent a graph handle.
+ * Graphs contain the neural network model that can be allocated on a device and executed.
+ * It should only be created and manipulated through the nc* FFI functions.
+ */
 typedef struct ncGraphHandle_t {
   uint8_t _private[0];
 } ncGraphHandle_t;
 
+/**
+ * Opaque handle for a FIFO (First-In-First-Out) queue.
+ *
+ * This is an opaque C-compatible type used in the FFI layer to represent a FIFO handle.
+ * FIFOs are used to pass input data to graphs and receive output data from them.
+ * They can be either host-readable (for outputs) or host-writable (for inputs).
+ * It should only be created and manipulated through the nc* FFI functions.
+ */
 typedef struct ncFifoHandle_t {
   uint8_t _private[0];
 } ncFifoHandle_t;
@@ -140,8 +164,8 @@ int ncDeviceDestroy(struct ncDeviceHandle_t **device_handle);
  * - All pointers must be valid
  */
 int ncDeviceGetOption(struct ncDeviceHandle_t *device_handle,
-                      int option,
-                      void *data,
+                      int _option,
+                      void *_data,
                       unsigned int *data_length);
 
 /**

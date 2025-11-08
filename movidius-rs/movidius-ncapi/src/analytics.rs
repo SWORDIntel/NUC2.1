@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+// Duration and Instant will be used for time-based metrics in future updates
 
 /// Comprehensive device metrics with statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,19 +164,29 @@ pub struct PerformanceIssue {
     pub recommendation: String,
 }
 
+/// Severity level of a performance issue
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IssueSeverity {
+    /// Critical issue requiring immediate attention
     Critical,
+    /// Warning that may impact performance
     Warning,
+    /// Informational notice
     Info,
 }
 
+/// Category of performance issue
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IssueCategory {
+    /// Thermal-related issue
     Thermal,
+    /// Memory-related issue
     Memory,
+    /// Performance degradation
     Performance,
+    /// Load balancing issue
     LoadBalance,
+    /// Resource availability issue
     Resource,
 }
 
@@ -204,6 +214,7 @@ pub struct LatencyTracker {
 }
 
 impl LatencyTracker {
+    /// Create a new latency tracker with specified maximum sample count
     pub fn new(max_samples: usize) -> Self {
         Self {
             samples: VecDeque::with_capacity(max_samples),
@@ -211,6 +222,7 @@ impl LatencyTracker {
         }
     }
 
+    /// Record a latency sample in milliseconds
     pub fn record(&mut self, latency_ms: f64) {
         if self.samples.len() >= self.max_samples {
             self.samples.pop_front();
@@ -218,6 +230,7 @@ impl LatencyTracker {
         self.samples.push_back(latency_ms);
     }
 
+    /// Calculate the percentile latency (0-100)
     pub fn percentile(&self, p: f64) -> f64 {
         if self.samples.is_empty() {
             return 0.0;
@@ -230,6 +243,7 @@ impl LatencyTracker {
         sorted[idx]
     }
 
+    /// Calculate average latency
     pub fn avg(&self) -> f64 {
         if self.samples.is_empty() {
             return 0.0;
@@ -237,6 +251,7 @@ impl LatencyTracker {
         self.samples.iter().sum::<f64>() / self.samples.len() as f64
     }
 
+    /// Calculate standard deviation of latency
     pub fn stddev(&self) -> f64 {
         if self.samples.is_empty() {
             return 0.0;
@@ -248,6 +263,7 @@ impl LatencyTracker {
         variance.sqrt()
     }
 
+    /// Get minimum latency
     pub fn min(&self) -> f64 {
         self.samples
             .iter()
@@ -256,6 +272,7 @@ impl LatencyTracker {
             .unwrap_or(0.0)
     }
 
+    /// Get maximum latency
     pub fn max(&self) -> f64 {
         self.samples
             .iter()

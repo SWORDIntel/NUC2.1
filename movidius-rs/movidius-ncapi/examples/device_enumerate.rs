@@ -3,7 +3,6 @@
 //! This example enumerates all available Movidius devices and prints their status.
 
 use movidius_ncapi::{Device, Status};
-use std::sync::Arc;
 
 fn main() {
     println!("Movidius Device Enumeration");

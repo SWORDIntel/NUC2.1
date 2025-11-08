@@ -37,5 +37,7 @@ pub use types::{GlobalOption, LogLevel};
 #[cfg(not(target_env = "msvc"))]
 pub mod ffi;
 
+/// NCAPI version number (major, minor, patch, hotfix)
 pub const VERSION: (u32, u32, u32, u32) = (2, 0, 0, 0);
+/// Maximum size for device and graph names
 pub const MAX_NAME_SIZE: usize = 28;

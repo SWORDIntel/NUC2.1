@@ -4,7 +4,6 @@
 //! to achieve ~2x throughput compared to a single device.
 
 use movidius_ncapi::{Device, Error, FifoDataType, Graph, TensorDescriptor};
-use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 

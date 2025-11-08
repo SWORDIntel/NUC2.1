@@ -2,7 +2,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 
 fn bench_tensor(c: &mut Criterion) {
     c.bench_function("tensor_default", |b| {
-        b.iter(|| movidius_ncapi::TensorDescriptor::default())
+        b.iter(movidius_ncapi::TensorDescriptor::default)
     });
 }
 

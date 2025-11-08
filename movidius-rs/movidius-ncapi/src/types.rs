@@ -11,7 +11,7 @@ pub enum GlobalOption {
 }
 
 /// Logging levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[repr(i32)]
 pub enum LogLevel {
     /// Fatal errors only
@@ -19,17 +19,12 @@ pub enum LogLevel {
     /// Errors and above
     Error = 1,
     /// Warnings and above (default)
+    #[default]
     Warn = 2,
     /// Info and above
     Info = 3,
     /// Debug and above (full verbosity)
     Debug = 4,
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        Self::Warn
-    }
 }
 
 impl LogLevel {

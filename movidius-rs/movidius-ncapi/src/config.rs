@@ -64,18 +64,13 @@ pub mod vpu {
     pub const HW_STAGES_OPTIMIZATION: bool = true;
 
     /// Tensor memory layout format
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum ComputeLayout {
         /// Native VPU format (NCHW)
+        #[default]
         VpuNchw,
         /// Alternative format (NHWC)
         VpuNhwc,
-    }
-
-    impl Default for ComputeLayout {
-        fn default() -> Self {
-            Self::VpuNchw
-        }
     }
 
     /// Enable reshape optimization
@@ -118,6 +113,7 @@ pub mod thermal {
     }
 
     impl ThrottleLevel {
+        /// Convert from u32 value to ThrottleLevel
         pub fn from_u32(value: u32) -> Self {
             match value {
                 0 => Self::None,
@@ -127,10 +123,12 @@ pub mod thermal {
             }
         }
 
+        /// Check if device is currently throttling
         pub fn is_throttling(&self) -> bool {
             *self != Self::None
         }
 
+        /// Check if throttling is at critical level
         pub fn is_critical(&self) -> bool {
             *self == Self::Upper
         }

@@ -1034,31 +1034,36 @@ static int movidius_release(struct inode *inode, struct file *file)
 
 static ssize_t total_inferences_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, *sysfs_kobj);
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
     return sprintf(buf, "%lld\n", atomic64_read(&dev->stats.total_inferences));
 }
 
 static ssize_t total_errors_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, *sysfs_kobj);
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
     return sprintf(buf, "%lld\n", atomic64_read(&dev->stats.total_errors));
 }
 
 static ssize_t queue_depth_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, *sysfs_kobj);
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
     return sprintf(buf, "%lld\n", atomic64_read(&dev->stats.queue_depth));
 }
 
 static ssize_t temperature_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, *sysfs_kobj);
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
     return sprintf(buf, "%d\n", dev->temperature);
 }
 
 static ssize_t firmware_version_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, *sysfs_kobj);
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
     if (dev->fw_info.loaded) {
         return sprintf(buf, "%s\n", dev->fw_info.version_string);
     }
@@ -1067,38 +1072,44 @@ static ssize_t firmware_version_show(struct kobject *kobj, struct kobj_attribute
 
 static ssize_t firmware_size_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, *sysfs_kobj);
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
     return sprintf(buf, "%zu\n", dev->fw_info.size);
 }
 
 static ssize_t compute_cycles_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, *sysfs_kobj);
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
     return sprintf(buf, "%lld\n", atomic64_read(&dev->hw_counters.compute_cycles));
 }
 
 static ssize_t memory_read_bytes_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, *sysfs_kobj);
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
     return sprintf(buf, "%lld\n", atomic64_read(&dev->hw_counters.memory_read_bytes));
 }
 
 static ssize_t memory_write_bytes_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, *sysfs_kobj);
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
     return sprintf(buf, "%lld\n", atomic64_read(&dev->hw_counters.memory_write_bytes));
 }
 
 static ssize_t compute_utilization_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, *sysfs_kobj);
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
     u64 util = atomic64_read(&dev->hw_counters.compute_utilization);
     return sprintf(buf, "%lld.%02lld\n", util / 100, util % 100);
 }
 
 static ssize_t memory_bandwidth_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    struct movidius_x_vpu_dev *dev = container_of(kobj, struct movidius_x_vpu_dev, sysfs_kobj);
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
     u64 bw = atomic64_read(&dev->hw_counters.memory_bandwidth);
     return sprintf(buf, "%lld.%02lld\n", bw / 100, bw % 100);
 }

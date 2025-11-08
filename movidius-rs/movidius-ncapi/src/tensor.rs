@@ -2,7 +2,7 @@
 
 use crate::fifo::FifoDataType;
 use bytemuck::{Pod, Zeroable};
-use cache_padded::CachePadded;
+use crossbeam_utils::CachePadded;
 
 /// Tensor descriptor describing shape and layout
 ///
