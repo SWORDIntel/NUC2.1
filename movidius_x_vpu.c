@@ -493,6 +493,18 @@ struct device_pool {
     atomic64_t total_migrations;
     atomic64_t total_stolen;
     atomic64_t pool_throughput;
+
+    /* Memory pool statistics */
+    atomic64_t total_allocations;
+    atomic64_t total_deallocations;
+    atomic64_t bytes_allocated;
+    atomic64_t peak_usage;
+
+    /* Firmware caching */
+    void *cached_firmware;
+    size_t cached_firmware_size;
+    uint32_t cached_firmware_crc;
+    atomic_t firmware_refcount;
 };
 
 /* Work item for cross-device migration */
@@ -1118,6 +1130,243 @@ static void remove_device_from_pool(struct movidius_x_vpu_dev *dev)
 
     spin_unlock_irqrestore(&global_pool_lock, flags);
     dev->pool = NULL;
+}
+
+/* ========== Shared Memory Pool Functions ========== */
+
+/**
+ * pool_alloc - Allocate memory from the shared device pool
+ * @size: Size in bytes to allocate
+ * @align: Alignment requirement (must be power of 2)
+ *
+ * Returns pointer to allocated memory, or NULL if pool is exhausted.
+ * Uses lock-free bump allocator for high performance.
+ */
+static void *pool_alloc(size_t size, size_t align)
+{
+    int offset, new_offset, aligned_offset;
+    void *ptr;
+    uint64_t current_usage, peak;
+
+    if (!global_pool.shared_memory || !enable_memory_pooling)
+        return NULL;
+
+    if (size == 0 || size > global_pool.shared_size)
+        return NULL;
+
+    /* Ensure alignment is power of 2 */
+    if (align == 0)
+        align = 8;  /* Default 8-byte alignment */
+    if (align & (align - 1))
+        return NULL;  /* Not power of 2 */
+
+    do {
+        offset = atomic_read(&global_pool.allocation_offset);
+
+        /* Align offset */
+        aligned_offset = (offset + align - 1) & ~(align - 1);
+        new_offset = aligned_offset + size;
+
+        /* Check if allocation would exceed pool size */
+        if (new_offset > global_pool.shared_size) {
+            pr_warn("Shared memory pool exhausted (requested %zu bytes, available %zu bytes)\n",
+                    size, global_pool.shared_size - offset);
+            return NULL;
+        }
+
+    } while (atomic_cmpxchg(&global_pool.allocation_offset, offset, new_offset) != offset);
+
+    ptr = (char *)global_pool.shared_memory + aligned_offset;
+
+    /* Update statistics */
+    atomic64_inc(&global_pool.total_allocations);
+    current_usage = atomic64_add_return(size, &global_pool.bytes_allocated);
+
+    /* Update peak usage */
+    do {
+        peak = atomic64_read(&global_pool.peak_usage);
+        if (current_usage <= peak)
+            break;
+    } while (atomic64_cmpxchg(&global_pool.peak_usage, peak, current_usage) != peak);
+
+    pr_debug("Pool allocated %zu bytes at offset %d (total usage: %llu bytes, %.1f%%)\n",
+             size, aligned_offset, current_usage,
+             (current_usage * 100.0) / global_pool.shared_size);
+
+    return ptr;
+}
+
+/**
+ * pool_free - Free memory allocated from the shared pool
+ * @ptr: Pointer to memory to free
+ * @size: Size of the allocation
+ *
+ * Note: Current implementation uses a bump allocator, so memory is not
+ * actually reclaimed until pool reset. This tracks deallocation statistics.
+ */
+static void pool_free(void *ptr, size_t size)
+{
+    if (!ptr || !global_pool.shared_memory)
+        return;
+
+    /* Verify pointer is within pool bounds */
+    if (ptr < global_pool.shared_memory ||
+        ptr >= (char *)global_pool.shared_memory + global_pool.shared_size) {
+        pr_warn("Attempt to free pointer outside pool bounds: %p\n", ptr);
+        return;
+    }
+
+    /* Update statistics */
+    atomic64_inc(&global_pool.total_deallocations);
+    atomic64_sub(size, &global_pool.bytes_allocated);
+
+    pr_debug("Pool freed %zu bytes (current usage: %lld bytes)\n",
+             size, atomic64_read(&global_pool.bytes_allocated));
+}
+
+/**
+ * pool_reset - Reset the shared memory pool
+ *
+ * Resets allocation offset to 0, effectively freeing all memory.
+ * Should only be called when no devices are actively using pool memory.
+ */
+static void pool_reset(void)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&global_pool_lock, flags);
+
+    atomic_set(&global_pool.allocation_offset, 0);
+    atomic64_set(&global_pool.bytes_allocated, 0);
+
+    spin_unlock_irqrestore(&global_pool_lock, flags);
+
+    pr_info("Shared memory pool reset (%zu MB available)\n",
+            global_pool.shared_size / (1024 * 1024));
+}
+
+/**
+ * pool_get_stats - Get shared memory pool statistics
+ * @total_allocs: Output for total allocation count
+ * @total_frees: Output for total deallocation count
+ * @bytes_used: Output for current bytes allocated
+ * @peak_bytes: Output for peak bytes allocated
+ */
+static void pool_get_stats(uint64_t *total_allocs, uint64_t *total_frees,
+                          uint64_t *bytes_used, uint64_t *peak_bytes)
+{
+    if (total_allocs)
+        *total_allocs = atomic64_read(&global_pool.total_allocations);
+    if (total_frees)
+        *total_frees = atomic64_read(&global_pool.total_deallocations);
+    if (bytes_used)
+        *bytes_used = atomic64_read(&global_pool.bytes_allocated);
+    if (peak_bytes)
+        *peak_bytes = atomic64_read(&global_pool.peak_usage);
+}
+
+/**
+ * pool_cache_firmware - Cache firmware in shared pool for multi-device reuse
+ * @data: Firmware data to cache
+ * @size: Size of firmware
+ * @crc: CRC32 of firmware for validation
+ *
+ * Returns 0 on success, negative error code on failure.
+ * If firmware is already cached with same CRC, increments refcount.
+ */
+static int pool_cache_firmware(const void *data, size_t size, uint32_t crc)
+{
+    unsigned long flags;
+    void *cached_copy;
+
+    if (!enable_memory_pooling || !global_pool.shared_memory)
+        return -ENODEV;
+
+    spin_lock_irqsave(&global_pool_lock, flags);
+
+    /* Check if firmware is already cached */
+    if (global_pool.cached_firmware &&
+        global_pool.cached_firmware_size == size &&
+        global_pool.cached_firmware_crc == crc) {
+        /* Firmware already cached, increment refcount */
+        atomic_inc(&global_pool.firmware_refcount);
+        spin_unlock_irqrestore(&global_pool_lock, flags);
+        pr_info("Firmware already cached, refcount: %d\n",
+                atomic_read(&global_pool.firmware_refcount));
+        return 0;
+    }
+
+    /* Need to cache new firmware */
+    if (global_pool.cached_firmware) {
+        /* Different firmware already cached, release it first */
+        pr_warn("Replacing cached firmware (old CRC: 0x%08x, new CRC: 0x%08x)\n",
+                global_pool.cached_firmware_crc, crc);
+        pool_free(global_pool.cached_firmware, global_pool.cached_firmware_size);
+        global_pool.cached_firmware = NULL;
+    }
+
+    spin_unlock_irqrestore(&global_pool_lock, flags);
+
+    /* Allocate from pool (outside lock) */
+    cached_copy = pool_alloc(size, 64);  /* 64-byte alignment for DMA */
+    if (!cached_copy) {
+        pr_err("Failed to allocate %zu bytes from pool for firmware cache\n", size);
+        return -ENOMEM;
+    }
+
+    /* Copy firmware data */
+    memcpy(cached_copy, data, size);
+
+    spin_lock_irqsave(&global_pool_lock, flags);
+    global_pool.cached_firmware = cached_copy;
+    global_pool.cached_firmware_size = size;
+    global_pool.cached_firmware_crc = crc;
+    atomic_set(&global_pool.firmware_refcount, 1);
+    spin_unlock_irqrestore(&global_pool_lock, flags);
+
+    pr_info("✓ Cached %zu KB firmware in shared pool (CRC: 0x%08x)\n",
+            size / 1024, crc);
+
+    return 0;
+}
+
+/**
+ * pool_get_cached_firmware - Get pointer to cached firmware
+ * @size: Output for firmware size
+ * @crc: Output for firmware CRC
+ *
+ * Returns pointer to cached firmware, or NULL if not cached.
+ * Caller should verify CRC matches expected value.
+ */
+static void *pool_get_cached_firmware(size_t *size, uint32_t *crc)
+{
+    unsigned long flags;
+    void *firmware = NULL;
+
+    spin_lock_irqsave(&global_pool_lock, flags);
+    if (global_pool.cached_firmware) {
+        firmware = global_pool.cached_firmware;
+        if (size)
+            *size = global_pool.cached_firmware_size;
+        if (crc)
+            *crc = global_pool.cached_firmware_crc;
+    }
+    spin_unlock_irqrestore(&global_pool_lock, flags);
+
+    return firmware;
+}
+
+/**
+ * pool_release_firmware - Decrement firmware refcount
+ *
+ * When refcount reaches 0, firmware remains cached but can be replaced.
+ */
+static void pool_release_firmware(void)
+{
+    if (global_pool.cached_firmware && atomic_read(&global_pool.firmware_refcount) > 0) {
+        int refcount = atomic_dec_return(&global_pool.firmware_refcount);
+        pr_debug("Firmware refcount: %d\n", refcount);
+    }
 }
 
 /* ========== Firmware Upload Helper Functions ========== */
@@ -2871,6 +3120,64 @@ static struct kobj_attribute compute_utilization_attr = __ATTR_RO(compute_utiliz
 static struct kobj_attribute memory_bandwidth_attr = __ATTR_RO(memory_bandwidth);
 static struct kobj_attribute performance_mode_attr = __ATTR_RW(performance_mode);
 
+/* Shared Memory Pool Statistics */
+static ssize_t pool_total_allocations_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%llu\n", atomic64_read(&global_pool.total_allocations));
+}
+
+static ssize_t pool_bytes_allocated_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%lld\n", atomic64_read(&global_pool.bytes_allocated));
+}
+
+static ssize_t pool_peak_usage_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%llu\n", atomic64_read(&global_pool.peak_usage));
+}
+
+static ssize_t pool_size_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%zu\n", global_pool.shared_size);
+}
+
+static ssize_t pool_utilization_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    uint64_t bytes_used = atomic64_read(&global_pool.bytes_allocated);
+    uint32_t percent = 0;
+
+    if (global_pool.shared_size > 0)
+        percent = (bytes_used * 100) / global_pool.shared_size;
+
+    return sprintf(buf, "%u\n", percent);
+}
+
+static ssize_t pool_cached_firmware_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    unsigned long flags;
+    int len = 0;
+
+    spin_lock_irqsave(&global_pool_lock, flags);
+    if (global_pool.cached_firmware) {
+        len = sprintf(buf, "size=%zu crc=0x%08x refcount=%d\n",
+                     global_pool.cached_firmware_size,
+                     global_pool.cached_firmware_crc,
+                     atomic_read(&global_pool.firmware_refcount));
+    } else {
+        len = sprintf(buf, "none\n");
+    }
+    spin_unlock_irqrestore(&global_pool_lock, flags);
+
+    return len;
+}
+
+static struct kobj_attribute pool_total_allocations_attr = __ATTR_RO(pool_total_allocations);
+static struct kobj_attribute pool_bytes_allocated_attr = __ATTR_RO(pool_bytes_allocated);
+static struct kobj_attribute pool_peak_usage_attr = __ATTR_RO(pool_peak_usage);
+static struct kobj_attribute pool_size_attr = __ATTR_RO(pool_size);
+static struct kobj_attribute pool_utilization_attr = __ATTR_RO(pool_utilization);
+static struct kobj_attribute pool_cached_firmware_attr = __ATTR_RO(pool_cached_firmware);
+
 static struct attribute *movidius_attrs[] = {
     &total_inferences_attr.attr,
     &total_errors_attr.attr,
@@ -2884,6 +3191,12 @@ static struct attribute *movidius_attrs[] = {
     &compute_utilization_attr.attr,
     &memory_bandwidth_attr.attr,
     &performance_mode_attr.attr,
+    &pool_total_allocations_attr.attr,
+    &pool_bytes_allocated_attr.attr,
+    &pool_peak_usage_attr.attr,
+    &pool_size_attr.attr,
+    &pool_utilization_attr.attr,
+    &pool_cached_firmware_attr.attr,
     NULL,
 };
 
@@ -3280,6 +3593,28 @@ static int __init movidius_x_vpu_init(void)
     atomic64_set(&global_pool.total_migrations, 0);
     atomic64_set(&global_pool.total_stolen, 0);
     atomic64_set(&global_pool.pool_throughput, 0);
+    atomic64_set(&global_pool.total_allocations, 0);
+    atomic64_set(&global_pool.total_deallocations, 0);
+    atomic64_set(&global_pool.bytes_allocated, 0);
+    atomic64_set(&global_pool.peak_usage, 0);
+    global_pool.cached_firmware = NULL;
+    global_pool.cached_firmware_size = 0;
+    global_pool.cached_firmware_crc = 0;
+    atomic_set(&global_pool.firmware_refcount, 0);
+
+    /* Allocate shared memory pool (64MB) for cross-device memory sharing */
+    if (enable_memory_pooling && global_pool.shared_size > 0) {
+        global_pool.shared_memory = vmalloc(global_pool.shared_size);
+        if (!global_pool.shared_memory) {
+            pr_warn("Failed to allocate %zu MB shared memory pool, continuing without it\n",
+                    global_pool.shared_size / (1024 * 1024));
+            global_pool.shared_size = 0;
+        } else {
+            memset(global_pool.shared_memory, 0, global_pool.shared_size);
+            pr_info("✓ Allocated %zu MB shared memory pool for multi-device coordination\n",
+                    global_pool.shared_size / (1024 * 1024));
+        }
+    }
 
     ret = alloc_chrdev_region(&movidius_devt, 0, MAX_DEVICES, DRIVER_NAME);
     if (ret) {
@@ -3335,11 +3670,32 @@ static int __init movidius_x_vpu_init(void)
 
 static void __exit movidius_x_vpu_exit(void)
 {
+    uint64_t total_allocs, total_frees, bytes_used, peak_bytes;
+
     usb_deregister(&movidius_x_vpu_driver);
     platform_driver_unregister(&movidius_platform_driver);
     class_destroy(movidius_class);
     unregister_chrdev_region(movidius_devt, MAX_DEVICES);
     ida_destroy(&movidius_minor_ida);
+
+    /* Free shared memory pool and print statistics */
+    if (global_pool.shared_memory) {
+        pool_get_stats(&total_allocs, &total_frees, &bytes_used, &peak_bytes);
+        pr_info("Shared memory pool statistics:\n");
+        pr_info("  Total allocations:   %llu\n", total_allocs);
+        pr_info("  Total deallocations: %llu\n", total_frees);
+        pr_info("  Peak usage:          %llu bytes (%.1f%% of %zu MB)\n",
+                peak_bytes, (peak_bytes * 100.0) / global_pool.shared_size,
+                global_pool.shared_size / (1024 * 1024));
+        pr_info("  Final usage:         %lld bytes\n",
+                atomic64_read(&global_pool.bytes_allocated));
+
+        vfree(global_pool.shared_memory);
+        global_pool.shared_memory = NULL;
+        pr_info("✓ Freed %zu MB shared memory pool\n",
+                global_pool.shared_size / (1024 * 1024));
+    }
+
     pr_info(DRIVER_NAME " driver unloaded\n");
 }
 
