@@ -1797,39 +1797,48 @@ static void pool_reset(struct device_pool *pool)
 {
     unsigned long flags;
 
-    spin_lock_irqsave(&global_pool_lock, flags);
+    if (!pool || !pool->active)
+        return;
 
-    atomic_set(&global_pool.allocation_offset, 0);
-    atomic64_set(&global_pool.bytes_allocated, 0);
+    spin_lock_irqsave(&pool->lock, flags);
 
-    spin_unlock_irqrestore(&global_pool_lock, flags);
+    atomic_set(&pool->allocation_offset, 0);
+    atomic64_set(&pool->bytes_allocated, 0);
 
-    pr_info("Shared memory pool reset (%zu MB available)\n",
-            global_pool.shared_size / (1024 * 1024));
+    spin_unlock_irqrestore(&pool->lock, flags);
+
+    pr_info("Pool %s reset (%zu MB available)\n",
+            pool->controller_pci, pool->shared_size / (1024 * 1024));
 }
 
 /**
  * pool_get_stats - Get shared memory pool statistics
+ * @pool: Pool to get statistics from
  * @total_allocs: Output for total allocation count
  * @total_frees: Output for total deallocation count
  * @bytes_used: Output for current bytes allocated
  * @peak_bytes: Output for peak bytes allocated
  */
-static void pool_get_stats(uint64_t *total_allocs, uint64_t *total_frees,
-                          uint64_t *bytes_used, uint64_t *peak_bytes)
+static void pool_get_stats(struct device_pool *pool, uint64_t *total_allocs,
+                          uint64_t *total_frees, uint64_t *bytes_used,
+                          uint64_t *peak_bytes)
 {
+    if (!pool || !pool->active)
+        return;
+
     if (total_allocs)
-        *total_allocs = atomic64_read(&global_pool.total_allocations);
+        *total_allocs = atomic64_read(&pool->total_allocations);
     if (total_frees)
-        *total_frees = atomic64_read(&global_pool.total_deallocations);
+        *total_frees = atomic64_read(&pool->total_deallocations);
     if (bytes_used)
-        *bytes_used = atomic64_read(&global_pool.bytes_allocated);
+        *bytes_used = atomic64_read(&pool->bytes_allocated);
     if (peak_bytes)
-        *peak_bytes = atomic64_read(&global_pool.peak_usage);
+        *peak_bytes = atomic64_read(&pool->peak_usage);
 }
 
 /**
  * pool_cache_firmware - Cache firmware in shared pool for multi-device reuse
+ * @pool: Pool to cache firmware in
  * @data: Firmware data to cache
  * @size: Size of firmware
  * @crc: CRC32 of firmware for validation
@@ -1837,98 +1846,109 @@ static void pool_get_stats(uint64_t *total_allocs, uint64_t *total_frees,
  * Returns 0 on success, negative error code on failure.
  * If firmware is already cached with same CRC, increments refcount.
  */
-static int pool_cache_firmware(const void *data, size_t size, uint32_t crc)
+static int pool_cache_firmware(struct device_pool *pool, const void *data,
+                               size_t size, uint32_t crc)
 {
     unsigned long flags;
     void *cached_copy;
 
-    if (!enable_memory_pooling || !global_pool.shared_memory)
+    if (!pool || !pool->active || !enable_memory_pooling || !pool->shared_memory)
         return -ENODEV;
 
-    spin_lock_irqsave(&global_pool_lock, flags);
+    spin_lock_irqsave(&pool->lock, flags);
 
     /* Check if firmware is already cached */
-    if (global_pool.cached_firmware &&
-        global_pool.cached_firmware_size == size &&
-        global_pool.cached_firmware_crc == crc) {
+    if (pool->cached_firmware &&
+        pool->cached_firmware_size == size &&
+        pool->cached_firmware_crc == crc) {
         /* Firmware already cached, increment refcount */
-        atomic_inc(&global_pool.firmware_refcount);
-        spin_unlock_irqrestore(&global_pool_lock, flags);
-        pr_info("Firmware already cached, refcount: %d\n",
-                atomic_read(&global_pool.firmware_refcount));
+        atomic_inc(&pool->firmware_refcount);
+        spin_unlock_irqrestore(&pool->lock, flags);
+        pr_info("Firmware already cached in pool %s, refcount: %d\n",
+                pool->controller_pci, atomic_read(&pool->firmware_refcount));
         return 0;
     }
 
     /* Need to cache new firmware */
-    if (global_pool.cached_firmware) {
+    if (pool->cached_firmware) {
         /* Different firmware already cached, release it first */
-        pr_warn("Replacing cached firmware (old CRC: 0x%08x, new CRC: 0x%08x)\n",
-                global_pool.cached_firmware_crc, crc);
-        pool_free(global_pool.cached_firmware, global_pool.cached_firmware_size);
-        global_pool.cached_firmware = NULL;
+        pr_warn("Replacing cached firmware in pool %s (old CRC: 0x%08x, new CRC: 0x%08x)\n",
+                pool->controller_pci, pool->cached_firmware_crc, crc);
+        pool_free(pool, pool->cached_firmware, pool->cached_firmware_size);
+        pool->cached_firmware = NULL;
     }
 
-    spin_unlock_irqrestore(&global_pool_lock, flags);
+    spin_unlock_irqrestore(&pool->lock, flags);
 
     /* Allocate from pool (outside lock) */
-    cached_copy = pool_alloc(size, 64);  /* 64-byte alignment for DMA */
+    cached_copy = pool_alloc(pool, size, 64);  /* 64-byte alignment for DMA */
     if (!cached_copy) {
-        pr_err("Failed to allocate %zu bytes from pool for firmware cache\n", size);
+        pr_err("Failed to allocate %zu bytes from pool %s for firmware cache\n",
+               size, pool->controller_pci);
         return -ENOMEM;
     }
 
     /* Copy firmware data */
     memcpy(cached_copy, data, size);
 
-    spin_lock_irqsave(&global_pool_lock, flags);
-    global_pool.cached_firmware = cached_copy;
-    global_pool.cached_firmware_size = size;
-    global_pool.cached_firmware_crc = crc;
-    atomic_set(&global_pool.firmware_refcount, 1);
-    spin_unlock_irqrestore(&global_pool_lock, flags);
+    spin_lock_irqsave(&pool->lock, flags);
+    pool->cached_firmware = cached_copy;
+    pool->cached_firmware_size = size;
+    pool->cached_firmware_crc = crc;
+    atomic_set(&pool->firmware_refcount, 1);
+    spin_unlock_irqrestore(&pool->lock, flags);
 
-    pr_info("✓ Cached %zu KB firmware in shared pool (CRC: 0x%08x)\n",
-            size / 1024, crc);
+    pr_info("✓ Cached %zu KB firmware in pool %s (CRC: 0x%08x)\n",
+            size / 1024, pool->controller_pci, crc);
 
     return 0;
 }
 
 /**
  * pool_get_cached_firmware - Get pointer to cached firmware
+ * @pool: Pool to get cached firmware from
  * @size: Output for firmware size
  * @crc: Output for firmware CRC
  *
  * Returns pointer to cached firmware, or NULL if not cached.
  * Caller should verify CRC matches expected value.
  */
-static void *pool_get_cached_firmware(size_t *size, uint32_t *crc)
+static void *pool_get_cached_firmware(struct device_pool *pool, size_t *size,
+                                      uint32_t *crc)
 {
     unsigned long flags;
     void *firmware = NULL;
 
-    spin_lock_irqsave(&global_pool_lock, flags);
-    if (global_pool.cached_firmware) {
-        firmware = global_pool.cached_firmware;
+    if (!pool || !pool->active)
+        return NULL;
+
+    spin_lock_irqsave(&pool->lock, flags);
+    if (pool->cached_firmware) {
+        firmware = pool->cached_firmware;
         if (size)
-            *size = global_pool.cached_firmware_size;
+            *size = pool->cached_firmware_size;
         if (crc)
-            *crc = global_pool.cached_firmware_crc;
+            *crc = pool->cached_firmware_crc;
     }
-    spin_unlock_irqrestore(&global_pool_lock, flags);
+    spin_unlock_irqrestore(&pool->lock, flags);
 
     return firmware;
 }
 
 /**
  * pool_release_firmware - Decrement firmware refcount
+ * @pool: Pool to release firmware from
  *
  * When refcount reaches 0, firmware remains cached but can be replaced.
  */
-static void pool_release_firmware(void)
+static void pool_release_firmware(struct device_pool *pool)
 {
-    if (global_pool.cached_firmware && atomic_read(&global_pool.firmware_refcount) > 0) {
-        int refcount = atomic_dec_return(&global_pool.firmware_refcount);
-        pr_debug("Firmware refcount: %d\n", refcount);
+    if (!pool || !pool->active)
+        return;
+
+    if (pool->cached_firmware && atomic_read(&pool->firmware_refcount) > 0) {
+        int refcount = atomic_dec_return(&pool->firmware_refcount);
+        pr_debug("Pool %s firmware refcount: %d\n", pool->controller_pci, refcount);
     }
 }
 
@@ -3076,6 +3096,11 @@ static void urb_complete_callback(struct urb *urb)
     struct io_uring_cmd *cmd = ctx->cmd;
     int result;
 
+    /* Update bandwidth statistics for USB controller */
+    if (urb->status == 0 && urb->actual_length > 0) {
+        update_bandwidth_stats(dev->pool, urb->actual_length);
+    }
+
     /* Update statistics */
     if (urb->status == 0) {
         atomic64_inc(&dev->stats.total_inferences);
@@ -4107,14 +4132,12 @@ static int movidius_platform_probe(struct platform_device *pdev)
     dev->usb_busnum = -1;
     snprintf(dev->controller_pci, sizeof(dev->controller_pci), "unknown");
 
-    /* Add device to global pool for multi-device coordination */
+    /* Add device to controller pool for multi-device coordination */
     ret = add_device_to_pool(dev);
     if (ret < 0 && ret != -ENOSPC) {
         dev_warn(&pdev->dev, "Failed to add device to pool: %d\n", ret);
-    } else if (ret == 0) {
-        dev_info(&pdev->dev, "✓ Added to device pool (pool has %d device(s))\n",
-                 global_pool.device_count);
     }
+    /* Success message already printed by add_device_to_pool() */
 
     /* Enable runtime PM */
     pm_runtime_set_active(&pdev->dev);
