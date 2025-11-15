@@ -1608,6 +1608,82 @@ static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struc
             dev_info(dev->dev, "Found firmware header (version %u, size %u)\n",
                      header->version, header->payload_size);
 
+            /* SECURITY: Validate header fields before using them to prevent OOB access */
+
+            /* 1. Validate header_size */
+            if (header->header_size < sizeof(struct firmware_header)) {
+                dev_err(dev->dev, "Invalid header_size (%u < %zu), rejecting firmware\n",
+                        header->header_size, sizeof(struct firmware_header));
+                if (backup_created)
+                    vfree(backup_data);
+                mutex_lock(&dev->pm_mutex);
+                pm_runtime_allow(dev->dev);
+                mutex_unlock(&dev->pm_mutex);
+                return -EINVAL;
+            }
+
+            if (header->header_size > fw->size) {
+                dev_err(dev->dev, "Invalid header_size (%u > %zu), rejecting firmware\n",
+                        header->header_size, fw->size);
+                if (backup_created)
+                    vfree(backup_data);
+                mutex_lock(&dev->pm_mutex);
+                pm_runtime_allow(dev->dev);
+                mutex_unlock(&dev->pm_mutex);
+                return -EINVAL;
+            }
+
+            /* 2. Validate payload_size (reasonable maximum: 512MB) */
+            if (header->payload_size == 0 || header->payload_size > (512 * 1024 * 1024)) {
+                dev_err(dev->dev, "Invalid payload_size (%u), rejecting firmware\n",
+                        header->payload_size);
+                if (backup_created)
+                    vfree(backup_data);
+                mutex_lock(&dev->pm_mutex);
+                pm_runtime_allow(dev->dev);
+                mutex_unlock(&dev->pm_mutex);
+                return -EINVAL;
+            }
+
+            /* 3. Validate compressed_size and ensure payload fits in firmware blob */
+            if (header->flags & FW_FLAG_COMPRESSED) {
+                if (header->compressed_size == 0) {
+                    dev_err(dev->dev, "Compressed firmware with zero compressed_size, rejecting\n");
+                    if (backup_created)
+                        vfree(backup_data);
+                    mutex_lock(&dev->pm_mutex);
+                    pm_runtime_allow(dev->dev);
+                    mutex_unlock(&dev->pm_mutex);
+                    return -EINVAL;
+                }
+
+                /* Check that header_size + compressed_size fits within firmware */
+                if (header->header_size + header->compressed_size > fw->size) {
+                    dev_err(dev->dev, "Compressed payload exceeds firmware size (%u + %u > %zu), rejecting\n",
+                            header->header_size, header->compressed_size, fw->size);
+                    if (backup_created)
+                        vfree(backup_data);
+                    mutex_lock(&dev->pm_mutex);
+                    pm_runtime_allow(dev->dev);
+                    mutex_unlock(&dev->pm_mutex);
+                    return -EINVAL;
+                }
+            } else {
+                /* Uncompressed: payload must fit after header */
+                if (header->header_size + header->payload_size > fw->size) {
+                    dev_err(dev->dev, "Payload exceeds firmware size (%u + %u > %zu), rejecting\n",
+                            header->header_size, header->payload_size, fw->size);
+                    if (backup_created)
+                        vfree(backup_data);
+                    mutex_lock(&dev->pm_mutex);
+                    pm_runtime_allow(dev->dev);
+                    mutex_unlock(&dev->pm_mutex);
+                    return -EINVAL;
+                }
+            }
+
+            dev_info(dev->dev, "✓ Firmware header validation passed\n");
+
             /* Copy header to firmware info */
             memcpy(&dev->fw_info.header, header, sizeof(struct firmware_header));
 
