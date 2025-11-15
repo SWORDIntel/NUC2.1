@@ -448,7 +448,7 @@ The benchmark tool (`movidius-bench`) provides:
 #### Performance Mode API (NEW)
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `default_perf_mode` | uint | 1 | Default performance mode: 0=ECO, 1=SAFE, 2=TURBO, 3=EXTREME, 4=INSANE, 5=CUSTOM |
+| `default_perf_mode` | uint | 2 | Default performance mode: 0=ECO, 1=SAFE, 2=TURBO, 3=EXTREME, 4=INSANE, 5=CUSTOM |
 
 #### Advanced Parameters
 | Parameter | Type | Default | Description |
@@ -466,12 +466,12 @@ The driver supports **six performance modes** with different power/performance t
 |------|------|---------|------------------|-----------------|------------------|
 | **ECO** (0) | 500 MHz | 1.0V | -30% | None | Passive |
 | **SAFE** (1) | 700 MHz | 1.0V | Baseline | None | Passive |
-| **TURBO** (2) | 900 MHz | 1.15V | **+25-30%** | **Minimal (<5%)** | **Passive Heatsink** |
+| **⭐ TURBO** (2) | 900 MHz | 1.15V | **+25-30%** | **Minimal (<5%)** | **Passive Heatsink** |
 | **EXTREME** (3) | 1000 MHz | 1.25V | +40-50% | High (weeks-months) | Active Cooling |
 | **INSANE** (4) | 1200 MHz | 1.4V | +60-70% | Critical (hours-days) | LN2/Phase-Change |
 | **CUSTOM** (5) | User-defined | User-defined | Variable | Variable | Depends |
 
-**⭐ RECOMMENDED: TURBO MODE** - Best balance of performance (+25-30%) with minimal lifespan impact (<5%).
+**⭐ DEFAULT: TURBO MODE** - Best balance of performance (+25-30%) with minimal lifespan impact (<5%).
 
 **Performance Mode Examples:**
 ```bash

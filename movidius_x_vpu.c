@@ -262,9 +262,9 @@ module_param(enable_overclocking, bool, 0644);
 MODULE_PARM_DESC(enable_overclocking, "Enable SHAVE overclocking beyond default (default false, USE WITH CAUTION)");
 
 /* Performance Mode Selection (NEW API) */
-static uint default_perf_mode = PERF_MODE_SAFE;
+static uint default_perf_mode = PERF_MODE_TURBO;
 module_param(default_perf_mode, uint, 0644);
-MODULE_PARM_DESC(default_perf_mode, "Default performance mode: 0=ECO, 1=SAFE, 2=TURBO, 3=EXTREME, 4=INSANE, 5=CUSTOM (default 1)");
+MODULE_PARM_DESC(default_perf_mode, "Default performance mode: 0=ECO, 1=SAFE, 2=TURBO, 3=EXTREME, 4=INSANE, 5=CUSTOM (default 2=TURBO)");
 
 /* Legacy mode parameters (deprecated - use default_perf_mode instead) */
 static bool enable_extreme_mode = false;
