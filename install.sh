@@ -1,5 +1,5 @@
 #!/bin/bash
-# Movidius Myriad X VPU Driver - Dynamic Installer
+# Movidius Myriad X VPU Driver - Dynamic Installer v2.2
 # Automatically detects kernel capabilities and builds with optimal configuration
 
 set -e
@@ -10,6 +10,154 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+# Usage function
+usage() {
+    echo "Usage: $0 [install|uninstall|systemd]"
+    echo ""
+    echo "Commands:"
+    echo "  (none)     - Build only (default)"
+    echo "  install    - Build and install system-wide"
+    echo "  uninstall  - Remove installed modules and files"
+    echo "  systemd    - Install systemd service for auto-loading"
+    echo ""
+    exit 1
+}
+
+# Uninstall function
+uninstall_driver() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}  Movidius Driver Uninstaller${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo ""
+
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}✗ Error: Uninstallation requires root privileges${NC}"
+        echo -e "  Run: sudo $0 uninstall"
+        exit 1
+    fi
+
+    echo -e "${BLUE}[1/5] Unloading Kernel Modules${NC}"
+    # Unload modules if loaded
+    if lsmod | grep -q movidius_x_vpu; then
+        rmmod movidius_x_vpu 2>/dev/null || true
+        echo -e "  ${GREEN}✓ Unloaded movidius_x_vpu${NC}"
+    else
+        echo -e "  ${YELLOW}⚠ Module not loaded${NC}"
+    fi
+
+    if lsmod | grep -q vfio_movidius; then
+        rmmod vfio_movidius 2>/dev/null || true
+        echo -e "  ${GREEN}✓ Unloaded vfio_movidius${NC}"
+    fi
+
+    echo ""
+    echo -e "${BLUE}[2/5] Removing Kernel Modules${NC}"
+    KERNEL_VERSION=$(uname -r)
+    rm -f "/lib/modules/${KERNEL_VERSION}/extra/movidius_x_vpu.ko"
+    rm -f "/lib/modules/${KERNEL_VERSION}/extra/vfio_movidius.ko"
+    depmod -a
+    echo -e "  ${GREEN}✓ Removed kernel modules${NC}"
+
+    echo ""
+    echo -e "${BLUE}[3/5] Removing Benchmark Tool${NC}"
+    if [ -f "/usr/local/bin/movidius-bench" ]; then
+        rm -f /usr/local/bin/movidius-bench
+        echo -e "  ${GREEN}✓ Removed movidius-bench${NC}"
+    else
+        echo -e "  ${YELLOW}⚠ movidius-bench not found${NC}"
+    fi
+
+    echo ""
+    echo -e "${BLUE}[4/5] Removing Udev Rules${NC}"
+    if [ -f "/etc/udev/rules.d/99-movidius.rules" ]; then
+        rm -f /etc/udev/rules.d/99-movidius.rules
+        udevadm control --reload-rules 2>/dev/null || true
+        echo -e "  ${GREEN}✓ Removed udev rules${NC}"
+    else
+        echo -e "  ${YELLOW}⚠ Udev rules not found${NC}"
+    fi
+
+    echo ""
+    echo -e "${BLUE}[5/5] Removing Systemd Service${NC}"
+    if [ -f "/etc/systemd/system/movidius-vpu.service" ]; then
+        systemctl stop movidius-vpu 2>/dev/null || true
+        systemctl disable movidius-vpu 2>/dev/null || true
+        rm -f /etc/systemd/system/movidius-vpu.service
+        systemctl daemon-reload
+        echo -e "  ${GREEN}✓ Removed systemd service${NC}"
+    else
+        echo -e "  ${YELLOW}⚠ Systemd service not found${NC}"
+    fi
+
+    echo ""
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}  Uninstallation Complete!${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    exit 0
+}
+
+# Systemd service installation
+install_systemd_service() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}  Systemd Service Installer${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo ""
+
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}✗ Error: Systemd installation requires root privileges${NC}"
+        echo -e "  Run: sudo $0 systemd"
+        exit 1
+    fi
+
+    echo -e "${BLUE}Creating systemd service...${NC}"
+
+    cat > /etc/systemd/system/movidius-vpu.service << 'EOF'
+[Unit]
+Description=Movidius Myriad X VPU Driver
+After=multi-user.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/modprobe movidius_x_vpu
+ExecStop=/sbin/rmmod movidius_x_vpu
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable movidius-vpu
+
+    echo -e "  ${GREEN}✓ Created /etc/systemd/system/movidius-vpu.service${NC}"
+    echo -e "  ${GREEN}✓ Enabled movidius-vpu service${NC}"
+    echo ""
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}  Systemd Service Installed!${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo ""
+    echo -e "The driver will now load automatically on boot."
+    echo -e ""
+    echo -e "Commands:"
+    echo -e "  Start:   ${BLUE}sudo systemctl start movidius-vpu${NC}"
+    echo -e "  Stop:    ${BLUE}sudo systemctl stop movidius-vpu${NC}"
+    echo -e "  Status:  ${BLUE}sudo systemctl status movidius-vpu${NC}"
+    echo -e "  Disable: ${BLUE}sudo systemctl disable movidius-vpu${NC}"
+    echo ""
+    exit 0
+}
+
+# Handle command-line arguments
+if [[ "${1}" == "uninstall" ]]; then
+    uninstall_driver
+elif [[ "${1}" == "systemd" ]]; then
+    install_systemd_service
+elif [[ "${1}" == "help" ]] || [[ "${1}" == "--help" ]] || [[ "${1}" == "-h" ]]; then
+    usage
+fi
 
 # Banner
 echo -e "${BLUE}========================================${NC}"
@@ -77,28 +225,73 @@ fi
 echo ""
 echo -e "${BLUE}[2/8] Checking Dependencies${NC}"
 
+# Function to prompt for package installation
+prompt_install() {
+    local package=$1
+    local description=$2
+
+    if [[ $EUID -eq 0 ]]; then
+        # Running as root, can auto-install
+        read -p "  Install $description now? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            # Detect package manager
+            if command -v apt-get &> /dev/null; then
+                apt-get update -qq && apt-get install -y $package
+            elif command -v dnf &> /dev/null; then
+                dnf install -y $package
+            elif command -v yum &> /dev/null; then
+                yum install -y $package
+            else
+                echo -e "  ${RED}✗ Unable to detect package manager${NC}"
+                return 1
+            fi
+            return 0
+        else
+            return 1
+        fi
+    else
+        # Not root, show manual install command
+        return 1
+    fi
+}
+
 # Check for kernel headers
 if [ ! -d "/lib/modules/${KERNEL_VERSION}/build" ]; then
     echo -e "  ${RED}✗ Kernel headers not found${NC}"
-    echo -e "  Install with: sudo apt-get install linux-headers-${KERNEL_VERSION}"
-    exit 1
+    if ! prompt_install "linux-headers-${KERNEL_VERSION}" "kernel headers"; then
+        echo -e "  ${YELLOW}  Manual install: sudo apt-get install linux-headers-${KERNEL_VERSION}${NC}"
+        exit 1
+    fi
 fi
 echo -e "  ${GREEN}✓ Kernel headers found${NC}"
 
 # Check for build tools
+NEED_BUILD_ESSENTIAL=0
 if ! command -v make &> /dev/null; then
     echo -e "  ${RED}✗ make not found${NC}"
-    echo -e "  Install with: sudo apt-get install build-essential"
-    exit 1
+    NEED_BUILD_ESSENTIAL=1
 fi
-echo -e "  ${GREEN}✓ make found${NC}"
 
 if ! command -v gcc &> /dev/null; then
     echo -e "  ${RED}✗ gcc not found${NC}"
-    echo -e "  Install with: sudo apt-get install build-essential"
-    exit 1
+    NEED_BUILD_ESSENTIAL=1
 fi
-echo -e "  ${GREEN}✓ gcc found${NC}"
+
+if [ $NEED_BUILD_ESSENTIAL -eq 1 ]; then
+    if ! prompt_install "build-essential" "build tools (gcc, make, etc.)"; then
+        echo -e "  ${YELLOW}  Manual install: sudo apt-get install build-essential${NC}"
+        exit 1
+    fi
+fi
+
+if command -v make &> /dev/null; then
+    echo -e "  ${GREEN}✓ make found${NC}"
+fi
+
+if command -v gcc &> /dev/null; then
+    echo -e "  ${GREEN}✓ gcc found${NC}"
+fi
 
 # Check for liburing (only required if io_uring is enabled)
 LIBURING_FOUND=0
@@ -111,9 +304,14 @@ if [ $ENABLE_IO_URING -eq 1 ]; then
         echo -e "  ${GREEN}✓ liburing headers found${NC}"
         LIBURING_FOUND=1
     else
-        echo -e "  ${YELLOW}⚠ liburing not found (required for benchmark tool)${NC}"
-        echo -e "  ${YELLOW}  Install with: sudo apt-get install liburing-dev${NC}"
-        echo -e "  ${YELLOW}  Continuing without benchmark tool...${NC}"
+        echo -e "  ${YELLOW}⚠ liburing not found (required for full io_uring support)${NC}"
+        if prompt_install "liburing-dev" "liburing (for io_uring benchmark tool)"; then
+            LIBURING_FOUND=1
+            echo -e "  ${GREEN}✓ liburing installed${NC}"
+        else
+            echo -e "  ${YELLOW}  Manual install: sudo apt-get install liburing-dev${NC}"
+            echo -e "  ${YELLOW}  Continuing without benchmark tool...${NC}"
+        fi
     fi
 fi
 
