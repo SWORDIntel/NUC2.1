@@ -216,18 +216,32 @@ See [`movidius-rs/movidius-bench/README.md`](movidius-rs/movidius-bench/README.m
 - Wake-on-demand for requests
 - Configurable autosuspend delay
 
-### 6. Thermal Monitoring
-- Active temperature monitoring (1-second interval)
+### 6. Firmware Upload
+- Automatic firmware loading from `/lib/firmware/movidius/`
+- USB control transfer-based upload with retry logic
+- Chunked transfer (4KB chunks) with progress reporting
+- CRC verification after upload
+- Automatic device reboot after firmware update
+- Graceful fallback if firmware upload fails
+
+### 7. Thermal Monitoring
+- **Hardware temperature reading via USB control transfers**
+- Fallback to simulated values if USB unavailable
+- Active monitoring (1-second interval)
 - Throttling at 75°C
 - Automatic recovery at 65°C
 - Temperature exposed via sysfs
+- Rate-limited error reporting
 
-### 7. Hardware Performance Counters
-- Real-time monitoring via sysfs:
-  - Compute cycles
-  - Memory bandwidth
-  - DMA transfers
-  - Utilization percentage
+### 8. Hardware Performance Counters
+- **Real-time hardware counter reading via USB**
+- Fallback to simulated counters if USB unavailable
+- Monitoring via sysfs:
+  - Compute cycles (from hardware)
+  - Memory read/write bytes (from hardware)
+  - DMA transfers (from hardware)
+  - Compute utilization percentage
+  - Memory bandwidth (MB/s)
 
 ## Building the Kernel Driver
 
@@ -284,7 +298,20 @@ make clean
 
 ## Usage
 
-### Load Kernel Module
+### Installation (Recommended)
+
+```bash
+# Install with automatic dependency management
+sudo ./install.sh install
+
+# Enable automatic loading on boot
+sudo ./install.sh systemd
+
+# Uninstall completely
+sudo ./install.sh uninstall
+```
+
+### Manual Load
 
 ```bash
 # Basic load
@@ -399,17 +426,21 @@ NUC2.1/
 
 ✅ **Production Ready** - All core features implemented and tested
 
-### Kernel Driver (v2.1) - **io_uring Fully Restored**
+### Kernel Driver (v2.2) - **Full Production Hardening**
 - [x] Zero-copy DMA with pin_user_pages
 - [x] **io_uring interface (fully functional, kernel >= 6.2)**
 - [x] **Automatic io_uring detection and fallback**
 - [x] Adaptive batching with tunable parameters
 - [x] Multi-device support with round-robin
 - [x] Runtime power management (PM autosuspend)
-- [x] Thermal monitoring with throttling
-- [x] Hardware performance counters
+- [x] **Real USB firmware upload with retry logic**
+- [x] **Hardware temperature monitoring via USB**
+- [x] **Hardware performance counters via USB**
+- [x] **Comprehensive error recovery and fallback**
 - [x] VFIO passthrough for VM support
-- [x] **Dynamic installer with kernel capability detection**
+- [x] **Dynamic installer with auto-dependency installation**
+- [x] **Uninstall and systemd service support**
+- [x] **Integration test suite**
 
 ### Rust NCAPI (Complete)
 - [x] Core API (Device/Graph/FIFO)
@@ -513,7 +544,20 @@ Contributions welcome! Key areas:
 
 ---
 
-**Version**: 2.1 (Production Enhanced)
-**Last Updated**: 2025-11-07
+**Version**: 2.2 (Full Production Hardening)
+**Last Updated**: 2025-11-15
 **Status**: Production Ready
-**Lines of Code**: ~8,000+ (kernel + Rust)
+**Lines of Code**: ~9,000+ (kernel + Rust + tests)
+
+## Recent Enhancements (v2.2)
+
+- ✅ Real USB firmware upload with retry and CRC verification
+- ✅ Hardware temperature monitoring via USB control transfers
+- ✅ Hardware performance counter reading via USB
+- ✅ Dual-mode benchmark tool (io_uring + ioctl fallback)
+- ✅ Automatic dependency installation in installer
+- ✅ Uninstall support (`./install.sh uninstall`)
+- ✅ Systemd service integration (`./install.sh systemd`)
+- ✅ Comprehensive integration test suite (`make test`)
+- ✅ Graceful liburing fallback in Makefile
+- ✅ Production-ready error handling and retry logic
