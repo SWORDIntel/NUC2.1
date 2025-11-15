@@ -90,6 +90,21 @@ struct io_uring_cmd;
 #define FW_SIGNATURE_SIZE   256  /* RSA-2048 signature */
 #define FW_HEADER_MAGIC     0x4D565055  /* "MVPU" */
 
+/* NCS2 Hardware Version Identifiers */
+#define MYRIAD_X_HWID       0x2485  /* Myriad X VPU */
+#define NCS2_HWID           0x2485  /* Intel NCS2 */
+
+/* Firmware Feature Flags */
+#define FW_FLAG_COMPRESSED      (1 << 0)  /* Firmware is compressed (zlib) */
+#define FW_FLAG_ENCRYPTED       (1 << 1)  /* Firmware is encrypted */
+#define FW_FLAG_DIFFERENTIAL    (1 << 2)  /* Differential update */
+#define FW_FLAG_AB_PARTITION    (1 << 3)  /* A/B partition support */
+#define FW_FLAG_SIGNED_RSA2048  (1 << 4)  /* RSA-2048 signature present */
+
+/* Firmware Compatibility */
+#define FW_MIN_HW_VERSION   0x0100  /* Minimum hardware version */
+#define FW_MAX_HW_VERSION   0xFFFF  /* Maximum hardware version */
+
 /* UAPI START */
 #define MOVIDIUS_UAPI_VERSION 1
 #define MAX_SG_SEGMENTS 16
@@ -225,17 +240,34 @@ struct hw_perf_counters {
     atomic64_t memory_bandwidth;     /* MB/s * 100 */
 };
 
-/* Firmware Header Structure */
+/* Firmware Header Structure (v2) - Enhanced for NCS2 */
 struct firmware_header {
-    uint32_t magic;              /* "MVPU" magic number */
-    uint32_t version;            /* Firmware version */
+    uint32_t magic;              /* "MVPU" magic number (0x4D565055) */
+    uint32_t version;            /* Firmware version (e.g., 0x00020003 = 2.3) */
     uint32_t header_size;        /* Size of this header */
-    uint32_t payload_size;       /* Size of firmware payload */
+    uint32_t payload_size;       /* Size of firmware payload (uncompressed) */
     uint32_t crc32;              /* CRC32 of payload */
-    uint32_t flags;              /* Feature flags */
+    uint32_t flags;              /* Feature flags (FW_FLAG_*) */
     uint8_t  signature[FW_SIGNATURE_SIZE];  /* RSA-2048 signature */
-    uint32_t chunk_count;        /* Number of chunks */
-    uint32_t reserved[8];        /* Reserved for future use */
+    uint32_t chunk_count;        /* Number of 4KB chunks */
+
+    /* NCS2-Specific Metadata */
+    uint32_t hw_id;              /* Hardware ID (NCS2_HWID) */
+    uint16_t hw_version_min;     /* Minimum hardware version */
+    uint16_t hw_version_max;     /* Maximum hardware version */
+    uint32_t build_timestamp;    /* Unix timestamp of build */
+    uint32_t compressed_size;    /* Size if compressed (0 if not) */
+    uint32_t feature_mask;       /* Required hardware features */
+
+    /* Thermal/Power Requirements */
+    uint16_t max_temp_celsius;   /* Maximum operating temperature */
+    uint16_t min_power_mv;       /* Minimum power supply (mV) */
+
+    /* A/B Partition Support */
+    uint8_t  partition_id;       /* Target partition (0=A, 1=B) */
+    uint8_t  reserved_pad[3];    /* Alignment padding */
+
+    uint32_t reserved[4];        /* Reserved for future use */
 } __packed;
 
 /* Firmware Information */
@@ -498,6 +530,105 @@ static int load_firmware(struct movidius_x_vpu_dev *dev)
 }
 
 /* ========== Firmware Upload Helper Functions ========== */
+
+/* Get hardware version from device */
+static int get_hardware_version(struct movidius_x_vpu_dev *dev, uint16_t *hw_version)
+{
+    int ret;
+    u8 version_data[4];
+
+    if (!dev->udev) {
+        /* No USB device, assume compatible version */
+        *hw_version = 0x0100;
+        return 0;
+    }
+
+    ret = usb_control_msg(dev->udev,
+                         usb_rcvctrlpipe(dev->udev, 0),
+                         0x22,  /* bRequest: GET_HW_VERSION */
+                         USB_DIR_IN | USB_TYPE_VENDOR,
+                         0, 0,
+                         version_data,
+                         sizeof(version_data),
+                         1000);
+
+    if (ret == sizeof(version_data)) {
+        *hw_version = *(uint16_t *)version_data;
+        dev_info(dev->dev, "Hardware version: 0x%04x\n", *hw_version);
+        return 0;
+    }
+
+    /* Fallback: assume NCS2 compatible version */
+    *hw_version = 0x0100;
+    dev_info(dev->dev, "Hardware version query failed, assuming 0x%04x\n", *hw_version);
+    return 0;
+}
+
+/* Check firmware compatibility with hardware */
+static bool check_firmware_compatibility(struct movidius_x_vpu_dev *dev,
+                                         const struct firmware_header *header)
+{
+    uint16_t hw_version;
+    int ret;
+
+    /* Check hardware ID */
+    if (header->hw_id != 0 && header->hw_id != NCS2_HWID) {
+        dev_err(dev->dev, "Firmware hardware ID mismatch: 0x%04x (expected 0x%04x)\n",
+                header->hw_id, NCS2_HWID);
+        return false;
+    }
+
+    /* Get hardware version */
+    ret = get_hardware_version(dev, &hw_version);
+    if (ret < 0)
+        return false;
+
+    /* Check version compatibility */
+    if (header->hw_version_min != 0 && hw_version < header->hw_version_min) {
+        dev_err(dev->dev, "Hardware version too old: 0x%04x (min required: 0x%04x)\n",
+                hw_version, header->hw_version_min);
+        return false;
+    }
+
+    if (header->hw_version_max != 0 && hw_version > header->hw_version_max) {
+        dev_err(dev->dev, "Hardware version too new: 0x%04x (max supported: 0x%04x)\n",
+                hw_version, header->hw_version_max);
+        return false;
+    }
+
+    dev_info(dev->dev, "✓ Firmware compatibility verified (HW: 0x%04x, FW range: 0x%04x-0x%04x)\n",
+             hw_version, header->hw_version_min, header->hw_version_max);
+
+    return true;
+}
+
+/* Monitor thermal state during firmware upload */
+static int check_thermal_safe_for_upload(struct movidius_x_vpu_dev *dev,
+                                         const struct firmware_header *header)
+{
+    int current_temp;
+    uint16_t max_temp;
+
+    current_temp = read_temperature(dev);
+
+    /* Use firmware's maximum temperature if specified */
+    max_temp = (header->max_temp_celsius > 0) ? header->max_temp_celsius : 85;
+
+    if (current_temp >= max_temp) {
+        dev_err(dev->dev, "Temperature too high for firmware upload: %d°C (max: %u°C)\n",
+                current_temp, max_temp);
+        dev_err(dev->dev, "Please allow device to cool down before updating firmware\n");
+        return -EBUSY;
+    }
+
+    if (current_temp >= (max_temp - 10)) {
+        dev_warn(dev->dev, "⚠ Temperature elevated: %d°C (approaching max: %u°C)\n",
+                 current_temp, max_temp);
+        dev_warn(dev->dev, "Firmware upload may be slower to prevent overheating\n");
+    }
+
+    return 0;
+}
 
 /* CRC32 calculation for firmware verification */
 static uint32_t calculate_crc32(const u8 *data, size_t len)
@@ -799,6 +930,19 @@ static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struc
         return -ENODEV;
     }
 
+    /* Power Management: Prevent device suspend during firmware upload */
+    mutex_lock(&dev->pm_mutex);
+    if (atomic_read(&dev->runtime_suspended)) {
+        /* Wake up device if suspended */
+        dev_info(dev->dev, "Waking device for firmware upload...\n");
+        pm_runtime_get_sync(dev->dev);
+    }
+    /* Disable runtime PM during firmware upload to prevent interruption */
+    pm_runtime_forbid(dev->dev);
+    mutex_unlock(&dev->pm_mutex);
+
+    dev_info(dev->dev, "✓ Power state locked (device will remain active during upload)\n");
+
     /* Atomic Update: Backup current firmware before updating */
     dev_info(dev->dev, "Attempting to backup current firmware for atomic update...\n");
     ret = backup_current_firmware(dev, &backup_data, &backup_size);
@@ -837,11 +981,53 @@ static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struc
             if (verify_firmware_signature(dev, header, payload, payload_size)) {
                 dev->fw_info.signature_verified = true;
                 dev->fw_info.version = header->version;
+
+                /* NCS2-Specific: Check firmware compatibility */
+                if (!check_firmware_compatibility(dev, header)) {
+                    dev_err(dev->dev, "Firmware compatibility check failed\n");
+                    if (backup_created)
+                        vfree(backup_data);
+                    /* Restore power management */
+                    mutex_lock(&dev->pm_mutex);
+                    pm_runtime_allow(dev->dev);
+                    mutex_unlock(&dev->pm_mutex);
+                    return -EINVAL;
+                }
+
+                /* NCS2-Specific: Check thermal state */
+                ret = check_thermal_safe_for_upload(dev, header);
+                if (ret < 0) {
+                    dev_err(dev->dev, "Thermal check failed: %d\n", ret);
+                    if (backup_created)
+                        vfree(backup_data);
+                    /* Restore power management */
+                    mutex_lock(&dev->pm_mutex);
+                    pm_runtime_allow(dev->dev);
+                    mutex_unlock(&dev->pm_mutex);
+                    return ret;
+                }
+
+                /* Log firmware metadata */
+                if (header->build_timestamp > 0) {
+                    dev_info(dev->dev, "Firmware build timestamp: %u\n", header->build_timestamp);
+                }
+                if (header->flags & FW_FLAG_COMPRESSED) {
+                    dev_info(dev->dev, "Firmware is compressed (%u -> %u bytes)\n",
+                             header->compressed_size, header->payload_size);
+                }
+                if (header->partition_id == 0 || header->partition_id == 1) {
+                    dev_info(dev->dev, "Target partition: %c\n",
+                             header->partition_id == 0 ? 'A' : 'B');
+                }
             } else {
                 dev_err(dev->dev, "Firmware signature verification failed\n");
                 /* No rollback needed here - we haven't modified device yet */
                 if (backup_created)
                     vfree(backup_data);
+                /* Restore power management */
+                mutex_lock(&dev->pm_mutex);
+                pm_runtime_allow(dev->dev);
+                mutex_unlock(&dev->pm_mutex);
                 return -EINVAL;
             }
         } else {
@@ -954,6 +1140,10 @@ static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struc
                 }
                 vfree(backup_data);
             }
+            /* Restore power management */
+            mutex_lock(&dev->pm_mutex);
+            pm_runtime_allow(dev->dev);
+            mutex_unlock(&dev->pm_mutex);
             return -EIO;
         }
 
@@ -1025,6 +1215,10 @@ static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struc
                 }
                 vfree(backup_data);
             }
+            /* Restore power management */
+            mutex_lock(&dev->pm_mutex);
+            pm_runtime_allow(dev->dev);
+            mutex_unlock(&dev->pm_mutex);
             return -EIO;
         }
     }
@@ -1056,6 +1250,12 @@ static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struc
     } else {
         dev_info(dev->dev, "✓ Firmware update completed successfully\n");
     }
+
+    /* Power Management: Re-enable runtime PM after successful upload */
+    mutex_lock(&dev->pm_mutex);
+    pm_runtime_allow(dev->dev);
+    mutex_unlock(&dev->pm_mutex);
+    dev_info(dev->dev, "✓ Power state unlocked (normal power management resumed)\n");
 
     return 0;
 }

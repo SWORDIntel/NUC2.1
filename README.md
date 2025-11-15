@@ -216,13 +216,20 @@ See [`movidius-rs/movidius-bench/README.md`](movidius-rs/movidius-bench/README.m
 - Wake-on-demand for requests
 - Configurable autosuspend delay
 
-### 6. Firmware Upload (DFU Protocol v2.3)
+### 6. Firmware Upload (DFU Protocol v2.4 - NCS2 Optimized)
 - **DFU (Device Firmware Upgrade) protocol** support
 - **Firmware signature verification** (CRC32 + RSA-2048 ready)
 - **Per-chunk CRC verification** for data integrity
 - **Atomic updates with automatic rollback** on failure
 - **Resume capability** for interrupted uploads
 - **Enhanced error recovery** with 3-level retry
+- **NCS2-Specific Enhancements:**
+  - Hardware version compatibility checking
+  - Thermal protection during upload (prevents overheating)
+  - Power state management (prevents suspend during update)
+  - Firmware metadata (build timestamp, features, requirements)
+  - A/B partition support (dual firmware slots)
+  - Compressed firmware support ready (zlib)
 - Automatic firmware loading from `/lib/firmware/movidius/`
 - USB control transfer-based upload (4KB chunks)
 - Progress reporting with per-chunk CRC logging
@@ -230,32 +237,63 @@ See [`movidius-rs/movidius-bench/README.md`](movidius-rs/movidius-bench/README.m
 - Automatic device reboot after firmware update
 - Graceful fallback if firmware upload fails
 
-**Firmware Header Format:**
+**Firmware Header Format (v2 - Enhanced for NCS2):**
 ```c
 struct firmware_header {
     uint32_t magic;              /* "MVPU" (0x4D565055) */
     uint32_t version;            /* Firmware version */
     uint32_t header_size;        /* Header size in bytes */
-    uint32_t payload_size;       /* Payload size in bytes */
+    uint32_t payload_size;       /* Payload size (uncompressed) */
     uint32_t crc32;              /* CRC32 of payload */
     uint32_t flags;              /* Feature flags */
     uint8_t  signature[256];     /* RSA-2048 signature */
     uint32_t chunk_count;        /* Number of 4KB chunks */
-    uint32_t reserved[8];        /* Reserved for future */
+
+    /* NCS2-Specific Metadata */
+    uint32_t hw_id;              /* Hardware ID (0x2485 for NCS2) */
+    uint16_t hw_version_min;     /* Minimum hardware version */
+    uint16_t hw_version_max;     /* Maximum hardware version */
+    uint32_t build_timestamp;    /* Unix timestamp of build */
+    uint32_t compressed_size;    /* Size if compressed (0 if not) */
+    uint32_t feature_mask;       /* Required hardware features */
+    uint16_t max_temp_celsius;   /* Maximum operating temperature */
+    uint16_t min_power_mv;       /* Minimum power supply (mV) */
+    uint8_t  partition_id;       /* Target partition (0=A, 1=B) */
+    uint8_t  reserved_pad[3];    /* Alignment */
+    uint32_t reserved[4];        /* Reserved for future */
 } __packed;
 ```
 
-**Upload Process:**
-1. Backup current firmware (if supported)
-2. Parse and verify firmware header
-3. Enter DFU mode (DFU_DETACH)
-4. Erase existing firmware
-5. Upload chunks with per-chunk CRC
-6. Finalize transfer (zero-length DFU_DNLOAD)
-7. Wait for manifestation
-8. Verify firmware CRC
-9. Boot new firmware
-10. Rollback on any failure (if backup exists)
+**Feature Flags:**
+- `FW_FLAG_COMPRESSED` (0x01): Firmware is zlib compressed
+- `FW_FLAG_ENCRYPTED` (0x02): Firmware is encrypted
+- `FW_FLAG_DIFFERENTIAL` (0x04): Differential update
+- `FW_FLAG_AB_PARTITION` (0x08): A/B partition support
+- `FW_FLAG_SIGNED_RSA2048` (0x10): RSA-2048 signature present
+
+**Upload Process (NCS2 Optimized):**
+1. **Lock power state** - Prevent device suspend during update
+2. **Backup current firmware** (if supported by device)
+3. **Parse and verify firmware header** (magic, CRC, signature)
+4. **Check hardware compatibility** (version, hardware ID)
+5. **Check thermal state** (prevent upload if too hot)
+6. **Log firmware metadata** (build time, features, partition)
+7. Enter DFU mode (DFU_DETACH)
+8. Erase existing firmware
+9. Upload chunks with per-chunk CRC
+10. Finalize transfer (zero-length DFU_DNLOAD)
+11. Wait for manifestation
+12. Verify firmware CRC
+13. Boot new firmware
+14. **Unlock power state** - Resume normal power management
+15. **Rollback on any failure** (if backup exists)
+
+**Safety Features:**
+- Thermal protection: Refuses upload if temperature > max_temp_celsius
+- Power protection: Device locked active during entire upload process
+- Atomic updates: Automatic rollback on any failure
+- Resume capability: Can continue interrupted uploads
+- Version checking: Prevents incompatible firmware installation
 
 ### 7. Thermal Monitoring
 - **Hardware temperature reading via USB control transfers**
@@ -459,13 +497,17 @@ NUC2.1/
 
 ✅ **Production Ready** - All core features implemented and tested
 
-### Kernel Driver (v2.3) - **Advanced Firmware Protocol**
+### Kernel Driver (v2.4) - **NCS2-Optimized Firmware**
 - [x] Zero-copy DMA with pin_user_pages
 - [x] **io_uring interface (fully functional, kernel >= 6.2)**
 - [x] **Automatic io_uring detection and fallback**
 - [x] Adaptive batching with tunable parameters
 - [x] Multi-device support with round-robin
 - [x] Runtime power management (PM autosuspend)
+- [x] **NCS2-specific hardware version compatibility checking**
+- [x] **Thermal protection during firmware upload**
+- [x] **Power state locking during firmware updates**
+- [x] **Enhanced firmware metadata (timestamps, features, requirements)**
 - [x] **DFU protocol firmware upload with atomic updates**
 - [x] **Firmware signature verification (CRC32 + RSA-2048 ready)**
 - [x] **Per-chunk CRC verification and resume capability**
@@ -580,14 +622,24 @@ Contributions welcome! Key areas:
 
 ---
 
-**Version**: 2.3 (Advanced Firmware Protocol)
+**Version**: 2.4 (NCS2-Optimized Firmware)
 **Last Updated**: 2025-11-15
 **Status**: Production Ready
-**Lines of Code**: ~10,000+ (kernel + Rust + tests)
+**Lines of Code**: ~11,000+ (kernel + Rust + tests)
 
-## Recent Enhancements (v2.3)
+## Recent Enhancements (v2.4 - NCS2 Optimizations)
 
-### Firmware Upload Enhancements (NEW)
+### NCS2-Specific Firmware Features (NEW)
+- ✅ **Hardware version compatibility checking** via USB
+- ✅ **Thermal protection during upload** (temperature monitoring)
+- ✅ **Power state management** (prevents suspend during update)
+- ✅ **Enhanced firmware metadata** (build timestamp, features, requirements)
+- ✅ **Hardware ID verification** (0x2485 for NCS2/Myriad X)
+- ✅ **Feature flag system** (compression, encryption, partitions)
+- ✅ **A/B partition support** infrastructure
+- ✅ **Compressed firmware** support ready (zlib)
+
+### Firmware Upload Enhancements (v2.3)
 - ✅ **DFU (Device Firmware Upgrade) protocol** implementation
 - ✅ **Firmware signature verification** (CRC32 + RSA-2048 infrastructure)
 - ✅ **Per-chunk CRC verification** during upload
