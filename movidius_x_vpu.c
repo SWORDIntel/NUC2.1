@@ -22,6 +22,7 @@
 #include <linux/mm.h>
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
+#include <linux/zlib.h>
 
 /* io_uring_cmd support - provides async zero-copy inference submission
  *
@@ -105,6 +106,28 @@ struct io_uring_cmd;
 #define FW_MIN_HW_VERSION   0x0100  /* Minimum hardware version */
 #define FW_MAX_HW_VERSION   0xFFFF  /* Maximum hardware version */
 
+/* Performance Tuning - Myriad X SHAVE Overclocking */
+#define SHAVE_COUNT         16      /* Number of SHAVE processors in Myriad X */
+#define SHAVE_DEFAULT_FREQ  700     /* Default SHAVE frequency (MHz) */
+#define SHAVE_MAX_FREQ      850     /* Maximum safe SHAVE frequency (MHz) */
+#define SHAVE_MIN_FREQ      400     /* Minimum SHAVE frequency (MHz) */
+
+/* Clock Control Registers (vendor-specific) */
+#define CLK_CTRL_REG        0x1000  /* Clock control register */
+#define SHAVE_CLK_REG       0x1004  /* SHAVE clock frequency register */
+#define VPU_CLK_REG         0x1008  /* VPU core clock register */
+#define DMA_CLK_REG         0x100C  /* DMA engine clock register */
+
+/* DMA Performance Tuning */
+#define DMA_BURST_SIZE_MIN  64      /* Minimum DMA burst size (bytes) */
+#define DMA_BURST_SIZE_MAX  4096    /* Maximum DMA burst size (bytes) */
+#define DMA_BURST_DEFAULT   512     /* Default DMA burst size (bytes) */
+
+/* Adaptive Batch Tuning */
+#define BATCH_SIZE_MIN      1       /* Minimum batch size */
+#define BATCH_SIZE_MAX      128     /* Maximum batch size */
+#define BATCH_AUTO_TUNE_INTERVAL_MS 1000  /* Auto-tune check interval */
+
 /* UAPI START */
 #define MOVIDIUS_UAPI_VERSION 1
 #define MAX_SG_SEGMENTS 16
@@ -178,6 +201,23 @@ MODULE_PARM_DESC(batch_high_watermark, "Queue depth threshold for batch dispatch
 static int submission_cpu_affinity = -1;
 module_param(submission_cpu_affinity, int, 0644);
 MODULE_PARM_DESC(submission_cpu_affinity, "CPU core for submission thread (-1 = no affinity)");
+
+/* Performance Tuning Parameters */
+static uint shave_freq_mhz = SHAVE_DEFAULT_FREQ;
+module_param(shave_freq_mhz, uint, 0644);
+MODULE_PARM_DESC(shave_freq_mhz, "SHAVE processor frequency in MHz (400-850, default 700)");
+
+static uint dma_burst_size = DMA_BURST_DEFAULT;
+module_param(dma_burst_size, uint, 0644);
+MODULE_PARM_DESC(dma_burst_size, "DMA burst size in bytes (64-4096, default 512)");
+
+static bool enable_auto_tuning = true;
+module_param(enable_auto_tuning, bool, 0644);
+MODULE_PARM_DESC(enable_auto_tuning, "Enable adaptive batch size auto-tuning (default true)");
+
+static bool enable_overclocking = false;
+module_param(enable_overclocking, bool, 0644);
+MODULE_PARM_DESC(enable_overclocking, "Enable SHAVE overclocking beyond default (default false, USE WITH CAUTION)");
 
 /* Forward declarations */
 static int movidius_platform_probe(struct platform_device *pdev);
@@ -342,6 +382,13 @@ struct movidius_x_vpu_dev {
     /* Power Management */
     atomic_t runtime_suspended;
     struct mutex pm_mutex;
+
+    /* Performance Tuning */
+    uint32_t current_shave_freq;     /* Current SHAVE frequency (MHz) */
+    uint32_t current_dma_burst;      /* Current DMA burst size */
+    uint32_t optimal_batch_size;     /* Auto-tuned optimal batch size */
+    struct delayed_work perf_tuning_work;  /* Auto-tuning worker */
+    bool perf_tuning_enabled;
 
     /* Global Device List */
     struct list_head global_list;
@@ -649,6 +696,81 @@ static uint32_t calculate_crc32(const u8 *data, size_t len)
     return ~crc;
 }
 
+/* Decompress firmware using zlib */
+static int decompress_firmware(struct movidius_x_vpu_dev *dev,
+                               const u8 *compressed_data,
+                               size_t compressed_size,
+                               u8 **decompressed_data,
+                               size_t decompressed_size)
+{
+    struct z_stream_s stream;
+    u8 *output;
+    int ret;
+
+    if (!compressed_data || !decompressed_data || decompressed_size == 0) {
+        dev_err(dev->dev, "Invalid decompression parameters\n");
+        return -EINVAL;
+    }
+
+    /* Allocate output buffer */
+    output = vmalloc(decompressed_size);
+    if (!output) {
+        dev_err(dev->dev, "Failed to allocate %zu bytes for decompression\n",
+                decompressed_size);
+        return -ENOMEM;
+    }
+
+    /* Initialize zlib stream */
+    memset(&stream, 0, sizeof(stream));
+    stream.next_in = (u8 *)compressed_data;
+    stream.avail_in = compressed_size;
+    stream.next_out = output;
+    stream.avail_out = decompressed_size;
+    stream.workspace = vmalloc(zlib_inflate_workspacesize());
+    if (!stream.workspace) {
+        dev_err(dev->dev, "Failed to allocate zlib workspace\n");
+        vfree(output);
+        return -ENOMEM;
+    }
+
+    /* Initialize inflater */
+    ret = zlib_inflateInit(&stream);
+    if (ret != Z_OK) {
+        dev_err(dev->dev, "zlib_inflateInit failed: %d\n", ret);
+        vfree(stream.workspace);
+        vfree(output);
+        return -EINVAL;
+    }
+
+    /* Decompress */
+    ret = zlib_inflate(&stream, Z_FINISH);
+    if (ret != Z_STREAM_END) {
+        dev_err(dev->dev, "Decompression failed: %d (expected %zu bytes, got %lu)\n",
+                ret, decompressed_size, stream.total_out);
+        zlib_inflateEnd(&stream);
+        vfree(stream.workspace);
+        vfree(output);
+        return -EIO;
+    }
+
+    /* Verify output size */
+    if (stream.total_out != decompressed_size) {
+        dev_warn(dev->dev, "Decompressed size mismatch: %lu vs %zu\n",
+                 stream.total_out, decompressed_size);
+    }
+
+    /* Cleanup */
+    zlib_inflateEnd(&stream);
+    vfree(stream.workspace);
+
+    dev_info(dev->dev, "✓ Firmware decompressed: %zu -> %lu bytes (%.1f%% compression)\n",
+             compressed_size, stream.total_out,
+             (1.0 - ((double)compressed_size / stream.total_out)) * 100.0);
+
+    *decompressed_data = output;
+    return 0;
+}
+
 /* Verify firmware signature (RSA-2048 or fallback to CRC) */
 static bool verify_firmware_signature(struct movidius_x_vpu_dev *dev,
                                       const struct firmware_header *header,
@@ -924,6 +1046,8 @@ static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struc
     u8 *backup_data = NULL;
     size_t backup_size = 0;
     bool backup_created = false;
+    u8 *decompressed_payload = NULL;  /* For zlib decompression */
+    bool needs_free_decompressed = false;
 
     if (!dev->udev) {
         dev_err(dev->dev, "No USB device for firmware upload\n");
@@ -974,9 +1098,30 @@ static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struc
             /* Copy header to firmware info */
             memcpy(&dev->fw_info.header, header, sizeof(struct firmware_header));
 
-            /* Verify signature */
-            payload = fw->data + header->header_size;
-            payload_size = header->payload_size;
+            /* Extract payload (may be compressed) */
+            if (header->flags & FW_FLAG_COMPRESSED) {
+                /* Decompress firmware */
+                const u8 *raw_payload = fw->data + header->header_size;
+                dev_info(dev->dev, "Firmware is compressed (zlib), decompressing...\n");
+                ret = decompress_firmware(dev, raw_payload, header->compressed_size,
+                                         &decompressed_payload, header->payload_size);
+                if (ret < 0) {
+                    dev_err(dev->dev, "Firmware decompression failed: %d\n", ret);
+                    if (backup_created)
+                        vfree(backup_data);
+                    /* Restore power management */
+                    mutex_lock(&dev->pm_mutex);
+                    pm_runtime_allow(dev->dev);
+                    mutex_unlock(&dev->pm_mutex);
+                    return ret;
+                }
+                payload = decompressed_payload;
+                payload_size = header->payload_size;
+                needs_free_decompressed = true;
+            } else {
+                payload = fw->data + header->header_size;
+                payload_size = header->payload_size;
+            }
 
             if (verify_firmware_signature(dev, header, payload, payload_size)) {
                 dev->fw_info.signature_verified = true;
@@ -1249,6 +1394,11 @@ static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struc
         dev_info(dev->dev, "✓ Firmware update completed successfully (atomic update)\n");
     } else {
         dev_info(dev->dev, "✓ Firmware update completed successfully\n");
+    }
+
+    /* Free decompressed firmware if allocated */
+    if (needs_free_decompressed && decompressed_payload) {
+        vfree(decompressed_payload);
     }
 
     /* Power Management: Re-enable runtime PM after successful upload */

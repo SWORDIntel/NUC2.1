@@ -434,6 +434,7 @@ The benchmark tool (`movidius-bench`) provides:
 
 ## Module Parameters
 
+### Basic Parameters
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `vid` | ushort | 0x03e7 | USB Vendor ID |
@@ -441,6 +442,27 @@ The benchmark tool (`movidius-bench`) provides:
 | `batch_delay_ms` | uint | 10 | Adaptive batch delay (ms) |
 | `batch_high_watermark` | uint | 32 | Queue depth for immediate dispatch |
 | `submission_cpu_affinity` | int | -1 | CPU core for submission thread |
+
+### Performance Tuning Parameters (v2.5)
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `shave_freq_mhz` | uint | 700 | SHAVE processor frequency in MHz (400-850) |
+| `dma_burst_size` | uint | 512 | DMA burst size in bytes (64-4096) |
+| `enable_auto_tuning` | bool | true | Enable adaptive batch size auto-tuning |
+| `enable_overclocking` | bool | false | Enable SHAVE overclocking beyond default ⚠️ |
+
+**Performance Tuning Examples:**
+```bash
+# Conservative performance boost
+sudo insmod movidius_x_vpu.ko shave_freq_mhz=750 dma_burst_size=1024
+
+# Maximum performance (with cooling)
+sudo insmod movidius_x_vpu.ko shave_freq_mhz=850 enable_overclocking=true \\
+    dma_burst_size=4096 batch_high_watermark=64
+
+# Power-efficient mode
+sudo insmod movidius_x_vpu.ko shave_freq_mhz=500 dma_burst_size=256
+```
 
 ## Sysfs Telemetry
 
@@ -497,10 +519,14 @@ NUC2.1/
 
 ✅ **Production Ready** - All core features implemented and tested
 
-### Kernel Driver (v2.4) - **NCS2-Optimized Firmware**
+### Kernel Driver (v2.5) - **High-Performance Edition**
 - [x] Zero-copy DMA with pin_user_pages
 - [x] **io_uring interface (fully functional, kernel >= 6.2)**
 - [x] **Automatic io_uring detection and fallback**
+- [x] **SHAVE processor overclocking (400-850 MHz)**
+- [x] **DMA burst size tuning (64-4096 bytes)**
+- [x] **Adaptive batch size auto-tuning**
+- [x] **Zlib compressed firmware support**
 - [x] Adaptive batching with tunable parameters
 - [x] Multi-device support with round-robin
 - [x] Runtime power management (PM autosuspend)
@@ -622,14 +648,23 @@ Contributions welcome! Key areas:
 
 ---
 
-**Version**: 2.4 (NCS2-Optimized Firmware)
+**Version**: 2.5 (High-Performance Edition)
 **Last Updated**: 2025-11-15
-**Status**: Production Ready
-**Lines of Code**: ~11,000+ (kernel + Rust + tests)
+**Status**: Production Ready - Performance Optimized
+**Lines of Code**: ~12,000+ (kernel + Rust + tests)
 
-## Recent Enhancements (v2.4 - NCS2 Optimizations)
+## Recent Enhancements (v2.5 - High-Performance Edition)
 
-### NCS2-Specific Firmware Features (NEW)
+### Performance Optimizations (NEW)
+- ✅ **SHAVE processor overclocking** (400-850 MHz, 16 cores)
+- ✅ **DMA burst size tuning** (64-4096 bytes)
+- ✅ **Adaptive batch size auto-tuning** framework
+- ✅ **Performance module parameters** for runtime tuning
+- ✅ **Zlib compressed firmware support** (reduces upload time)
+- ✅ **Clock frequency control** (SHAVE/VPU/DMA clocks)
+- ✅ **Memory bandwidth optimization** infrastructure
+
+### NCS2-Specific Firmware Features (v2.4)
 - ✅ **Hardware version compatibility checking** via USB
 - ✅ **Thermal protection during upload** (temperature monitoring)
 - ✅ **Power state management** (prevents suspend during update)
