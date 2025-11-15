@@ -10,6 +10,7 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <math.h>
 
 /* Conditionally include liburing if available */
 #ifndef HAS_LIBURING
@@ -766,6 +767,11 @@ int main(int argc, char *argv[]) {
     /* Read sysfs statistics */
     for (int i = 0; i < num_devices; i++) {
         read_sysfs_stats(i);
+    }
+
+    /* Multi-device performance analysis */
+    if (num_devices > 0) {
+        print_multi_device_stats();
     }
 
     /* Cleanup */

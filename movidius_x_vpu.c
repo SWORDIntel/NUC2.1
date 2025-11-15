@@ -287,7 +287,7 @@ static uint max_temperature = TEMP_THROTTLE_SAFE;
 module_param(max_temperature, uint, 0644);
 MODULE_PARM_DESC(max_temperature, "Maximum temperature before throttle (75-105°C, default 75)");
 
-/* Forward declarations */
+/* Forward declarations (basic functions before struct definitions) */
 static int movidius_platform_probe(struct platform_device *pdev);
 static int movidius_platform_remove(struct platform_device *pdev);
 #ifdef HAS_URING_CMD
@@ -296,7 +296,6 @@ static int movidius_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags
 static long movidius_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 static int movidius_open(struct inode *inode, struct file *file);
 static int movidius_release(struct inode *inode, struct file *file);
-static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struct firmware *fw);
 
 /* DMA Arena Structure */
 struct dma_arena {
@@ -519,6 +518,10 @@ static struct device_pool global_pool = {
     .shared_size = 64 * 1024 * 1024,  /* 64MB shared pool */
 };
 static DEFINE_SPINLOCK(global_pool_lock);
+
+/* Forward declarations for device-dependent functions */
+static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struct firmware *fw);
+static int read_temperature(struct movidius_x_vpu_dev *dev);
 
 static const struct file_operations movidius_fops = {
     .owner = THIS_MODULE,
@@ -970,7 +973,7 @@ static int apply_extreme_profile(struct movidius_x_vpu_dev *dev)
 static struct movidius_x_vpu_dev *find_least_loaded_device(struct device_pool *pool)
 {
     struct movidius_x_vpu_dev *best_dev = NULL;
-    uint64_t min_queue = UINT64_MAX;
+    uint64_t min_queue = ~0ULL;  /* Maximum uint64_t value */
     int i;
 
     if (!pool || pool->device_count == 0)
@@ -2934,6 +2937,12 @@ static int movidius_platform_probe(struct platform_device *pdev)
     /* Start performance counter monitoring */
     start_perf_monitoring(dev);
 
+    /* Apply performance mode */
+    ret = apply_extreme_profile(dev);
+    if (ret < 0) {
+        dev_warn(&pdev->dev, "Failed to apply performance mode, using defaults\n");
+    }
+
     /* Enable runtime PM */
     pm_runtime_set_active(&pdev->dev);
     pm_runtime_enable(&pdev->dev);
@@ -2946,6 +2955,8 @@ static int movidius_platform_probe(struct platform_device *pdev)
              dev->fw_info.loaded ? dev->fw_info.version_string : "not loaded");
     dev_info(&pdev->dev, "  - Thermal monitoring: enabled\n");
     dev_info(&pdev->dev, "  - Performance counters: enabled\n");
+    dev_info(&pdev->dev, "  - Performance mode: %s\n",
+             get_perf_mode_name(dev->current_perf_mode));
     dev_info(&pdev->dev, "  - Runtime PM: enabled\n");
     return 0;
 
