@@ -17,12 +17,12 @@ all:
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f test_app
+	rm -f movidius-bench
 
-test: test_app
+bench: movidius-bench
 
-test_app: test_app.c
-	gcc test_app.c -o test_app -luring -O2 -Wall
+movidius-bench: movidius-bench.c
+	gcc movidius-bench.c -o movidius-bench -luring -O2 -Wall -Wextra
 
 install:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
@@ -39,14 +39,19 @@ help:
 	@echo "Targets:"
 	@echo "  all       - Build kernel modules (default)"
 	@echo "  clean     - Clean build artifacts"
-	@echo "  test      - Build test application"
+	@echo "  bench     - Build benchmark application"
 	@echo "  install   - Install kernel modules"
 	@echo "  uninstall - Remove installed modules"
 	@echo "  help      - Show this help message"
 	@echo ""
+	@echo "Options:"
+	@echo "  ENABLE_IO_URING=1  - Enable io_uring support (default, requires kernel >= 6.2)"
+	@echo "  ENABLE_IO_URING=0  - Disable io_uring, use ioctl only (legacy kernels)"
+	@echo ""
 	@echo "Examples:"
-	@echo "  make              # Build modules"
-	@echo "  make test         # Build test app"
-	@echo "  sudo make install # Install modules"
+	@echo "  make                          # Build modules with io_uring"
+	@echo "  make ENABLE_IO_URING=0        # Build without io_uring"
+	@echo "  make bench                    # Build benchmark tool"
+	@echo "  sudo make install             # Install modules"
 
-.PHONY: all clean test install uninstall help
+.PHONY: all clean bench install uninstall help
