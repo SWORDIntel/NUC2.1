@@ -1089,6 +1089,37 @@ out:
     return ret;
 }
 
+/* Remove device from global pool */
+static void remove_device_from_pool(struct movidius_x_vpu_dev *dev)
+{
+    unsigned long flags;
+    int i;
+
+    if (!dev->pool)
+        return;
+
+    spin_lock_irqsave(&global_pool_lock, flags);
+
+    /* Find and remove device from pool */
+    for (i = 0; i < global_pool.device_count; i++) {
+        if (global_pool.devices[i] == dev) {
+            /* Shift remaining devices */
+            for (; i < global_pool.device_count - 1; i++) {
+                global_pool.devices[i] = global_pool.devices[i + 1];
+                atomic_set(&global_pool.devices[i]->pool_id, i);
+            }
+            global_pool.devices[global_pool.device_count - 1] = NULL;
+            global_pool.device_count--;
+            dev_info(dev->dev, "Removed from device pool (%d device(s) remaining)\n",
+                     global_pool.device_count);
+            break;
+        }
+    }
+
+    spin_unlock_irqrestore(&global_pool_lock, flags);
+    dev->pool = NULL;
+}
+
 /* ========== Firmware Upload Helper Functions ========== */
 
 /* Get hardware version from device */
@@ -3019,6 +3050,20 @@ static int movidius_platform_probe(struct platform_device *pdev)
         dev_warn(&pdev->dev, "Failed to apply performance mode, using defaults\n");
     }
 
+    /* Initialize multi-device coordination */
+    atomic64_set(&dev->stolen_tasks, 0);
+    atomic64_set(&dev->donated_tasks, 0);
+    dev->pool = NULL;
+
+    /* Add device to global pool for multi-device coordination */
+    ret = add_device_to_pool(dev);
+    if (ret < 0 && ret != -ENOSPC) {
+        dev_warn(&pdev->dev, "Failed to add device to pool: %d\n", ret);
+    } else if (ret == 0) {
+        dev_info(&pdev->dev, "✓ Added to device pool (pool has %d device(s))\n",
+                 global_pool.device_count);
+    }
+
     /* Enable runtime PM */
     pm_runtime_set_active(&pdev->dev);
     pm_runtime_enable(&pdev->dev);
@@ -3033,6 +3078,8 @@ static int movidius_platform_probe(struct platform_device *pdev)
     dev_info(&pdev->dev, "  - Performance counters: enabled\n");
     dev_info(&pdev->dev, "  - Performance mode: %s\n",
              get_perf_mode_name(dev->current_perf_mode));
+    dev_info(&pdev->dev, "  - Multi-device pool: %s\n",
+             dev->pool ? "enabled" : "disabled");
     dev_info(&pdev->dev, "  - Runtime PM: enabled\n");
     return 0;
 
@@ -3055,6 +3102,9 @@ static int movidius_platform_remove(struct platform_device *pdev)
     dev_info(&pdev->dev, "platform remove entered\n");
 
     atomic_set(&dev->device_active, 0);
+
+    /* Remove from device pool */
+    remove_device_from_pool(dev);
 
     /* Disable runtime PM */
     pm_runtime_dont_use_autosuspend(&pdev->dev);
@@ -3201,6 +3251,17 @@ static struct usb_driver movidius_x_vpu_driver = {
 static int __init movidius_x_vpu_init(void)
 {
     int ret;
+
+    /* Initialize global device pool */
+    spin_lock_init(&global_pool.lock);
+    INIT_LIST_HEAD(&global_pool.global_work_queue);
+    spin_lock_init(&global_pool.work_queue_lock);
+    init_waitqueue_head(&global_pool.work_available);
+    atomic_set(&global_pool.allocation_offset, 0);
+    atomic_set(&global_pool.round_robin_index, 0);
+    atomic64_set(&global_pool.total_migrations, 0);
+    atomic64_set(&global_pool.total_stolen, 0);
+    atomic64_set(&global_pool.pool_throughput, 0);
 
     ret = alloc_chrdev_region(&movidius_devt, 0, MAX_DEVICES, DRIVER_NAME);
     if (ret) {
