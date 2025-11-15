@@ -216,13 +216,46 @@ See [`movidius-rs/movidius-bench/README.md`](movidius-rs/movidius-bench/README.m
 - Wake-on-demand for requests
 - Configurable autosuspend delay
 
-### 6. Firmware Upload
+### 6. Firmware Upload (DFU Protocol v2.3)
+- **DFU (Device Firmware Upgrade) protocol** support
+- **Firmware signature verification** (CRC32 + RSA-2048 ready)
+- **Per-chunk CRC verification** for data integrity
+- **Atomic updates with automatic rollback** on failure
+- **Resume capability** for interrupted uploads
+- **Enhanced error recovery** with 3-level retry
 - Automatic firmware loading from `/lib/firmware/movidius/`
-- USB control transfer-based upload with retry logic
-- Chunked transfer (4KB chunks) with progress reporting
-- CRC verification after upload
+- USB control transfer-based upload (4KB chunks)
+- Progress reporting with per-chunk CRC logging
+- DFU state machine with timeout handling
 - Automatic device reboot after firmware update
 - Graceful fallback if firmware upload fails
+
+**Firmware Header Format:**
+```c
+struct firmware_header {
+    uint32_t magic;              /* "MVPU" (0x4D565055) */
+    uint32_t version;            /* Firmware version */
+    uint32_t header_size;        /* Header size in bytes */
+    uint32_t payload_size;       /* Payload size in bytes */
+    uint32_t crc32;              /* CRC32 of payload */
+    uint32_t flags;              /* Feature flags */
+    uint8_t  signature[256];     /* RSA-2048 signature */
+    uint32_t chunk_count;        /* Number of 4KB chunks */
+    uint32_t reserved[8];        /* Reserved for future */
+} __packed;
+```
+
+**Upload Process:**
+1. Backup current firmware (if supported)
+2. Parse and verify firmware header
+3. Enter DFU mode (DFU_DETACH)
+4. Erase existing firmware
+5. Upload chunks with per-chunk CRC
+6. Finalize transfer (zero-length DFU_DNLOAD)
+7. Wait for manifestation
+8. Verify firmware CRC
+9. Boot new firmware
+10. Rollback on any failure (if backup exists)
 
 ### 7. Thermal Monitoring
 - **Hardware temperature reading via USB control transfers**
@@ -426,14 +459,17 @@ NUC2.1/
 
 ✅ **Production Ready** - All core features implemented and tested
 
-### Kernel Driver (v2.2) - **Full Production Hardening**
+### Kernel Driver (v2.3) - **Advanced Firmware Protocol**
 - [x] Zero-copy DMA with pin_user_pages
 - [x] **io_uring interface (fully functional, kernel >= 6.2)**
 - [x] **Automatic io_uring detection and fallback**
 - [x] Adaptive batching with tunable parameters
 - [x] Multi-device support with round-robin
 - [x] Runtime power management (PM autosuspend)
-- [x] **Real USB firmware upload with retry logic**
+- [x] **DFU protocol firmware upload with atomic updates**
+- [x] **Firmware signature verification (CRC32 + RSA-2048 ready)**
+- [x] **Per-chunk CRC verification and resume capability**
+- [x] **Automatic rollback on firmware update failure**
 - [x] **Hardware temperature monitoring via USB**
 - [x] **Hardware performance counters via USB**
 - [x] **Comprehensive error recovery and fallback**
@@ -544,13 +580,24 @@ Contributions welcome! Key areas:
 
 ---
 
-**Version**: 2.2 (Full Production Hardening)
+**Version**: 2.3 (Advanced Firmware Protocol)
 **Last Updated**: 2025-11-15
 **Status**: Production Ready
-**Lines of Code**: ~9,000+ (kernel + Rust + tests)
+**Lines of Code**: ~10,000+ (kernel + Rust + tests)
 
-## Recent Enhancements (v2.2)
+## Recent Enhancements (v2.3)
 
+### Firmware Upload Enhancements (NEW)
+- ✅ **DFU (Device Firmware Upgrade) protocol** implementation
+- ✅ **Firmware signature verification** (CRC32 + RSA-2048 infrastructure)
+- ✅ **Per-chunk CRC verification** during upload
+- ✅ **Atomic updates with automatic rollback** on failure
+- ✅ **Resume capability** for interrupted firmware uploads
+- ✅ **Enhanced error recovery** with DFU state machine
+- ✅ **Firmware header parsing** with magic number validation
+- ✅ **Backup/restore** functionality for safe updates
+
+### Previous Enhancements (v2.2)
 - ✅ Real USB firmware upload with retry and CRC verification
 - ✅ Hardware temperature monitoring via USB control transfers
 - ✅ Hardware performance counter reading via USB

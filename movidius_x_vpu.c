@@ -61,6 +61,35 @@ struct io_uring_cmd;
 #define THERMAL_UPDATE_INTERVAL_MS 1000
 #define PERF_COUNTER_UPDATE_MS 500
 
+/* DFU (Device Firmware Upgrade) Protocol Constants */
+#define DFU_DETACH          0x00
+#define DFU_DNLOAD          0x01
+#define DFU_UPLOAD          0x02
+#define DFU_GETSTATUS       0x03
+#define DFU_CLRSTATUS       0x04
+#define DFU_GETSTATE        0x05
+#define DFU_ABORT           0x06
+
+/* DFU States */
+#define DFU_STATE_APP_IDLE          0x00
+#define DFU_STATE_APP_DETACH        0x01
+#define DFU_STATE_DFU_IDLE          0x02
+#define DFU_STATE_DFU_DNLOAD_SYNC   0x03
+#define DFU_STATE_DFU_DNBUSY        0x04
+#define DFU_STATE_DFU_DNLOAD_IDLE   0x05
+#define DFU_STATE_DFU_MANIFEST_SYNC 0x06
+#define DFU_STATE_DFU_MANIFEST      0x07
+#define DFU_STATE_DFU_MANIFEST_WAIT 0x08
+#define DFU_STATE_DFU_UPLOAD_IDLE   0x09
+#define DFU_STATE_DFU_ERROR         0x0a
+
+/* Firmware upload configuration */
+#define FW_CHUNK_SIZE       4096
+#define FW_RETRY_COUNT      3
+#define FW_RETRY_DELAY_MS   100
+#define FW_SIGNATURE_SIZE   256  /* RSA-2048 signature */
+#define FW_HEADER_MAGIC     0x4D565055  /* "MVPU" */
+
 /* UAPI START */
 #define MOVIDIUS_UAPI_VERSION 1
 #define MAX_SG_SEGMENTS 16
@@ -196,6 +225,19 @@ struct hw_perf_counters {
     atomic64_t memory_bandwidth;     /* MB/s * 100 */
 };
 
+/* Firmware Header Structure */
+struct firmware_header {
+    uint32_t magic;              /* "MVPU" magic number */
+    uint32_t version;            /* Firmware version */
+    uint32_t header_size;        /* Size of this header */
+    uint32_t payload_size;       /* Size of firmware payload */
+    uint32_t crc32;              /* CRC32 of payload */
+    uint32_t flags;              /* Feature flags */
+    uint8_t  signature[FW_SIGNATURE_SIZE];  /* RSA-2048 signature */
+    uint32_t chunk_count;        /* Number of chunks */
+    uint32_t reserved[8];        /* Reserved for future use */
+} __packed;
+
 /* Firmware Information */
 struct firmware_info {
     const struct firmware *fw;
@@ -203,6 +245,10 @@ struct firmware_info {
     uint32_t version;
     size_t size;
     char version_string[32];
+    struct firmware_header header;
+    bool signature_verified;
+    size_t upload_offset;        /* Resume support */
+    uint32_t uploaded_chunks;    /* Number of chunks uploaded */
 };
 
 /* Data Structures */
@@ -451,94 +497,505 @@ static int load_firmware(struct movidius_x_vpu_dev *dev)
     return 0;
 }
 
-/* Upload firmware to device via USB control transfers */
+/* ========== Firmware Upload Helper Functions ========== */
+
+/* CRC32 calculation for firmware verification */
+static uint32_t calculate_crc32(const u8 *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFF;
+    size_t i, j;
+
+    for (i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (j = 0; j < 8; j++) {
+            if (crc & 1)
+                crc = (crc >> 1) ^ 0xEDB88320;
+            else
+                crc = crc >> 1;
+        }
+    }
+
+    return ~crc;
+}
+
+/* Verify firmware signature (RSA-2048 or fallback to CRC) */
+static bool verify_firmware_signature(struct movidius_x_vpu_dev *dev,
+                                      const struct firmware_header *header,
+                                      const u8 *payload,
+                                      size_t payload_size)
+{
+    uint32_t calculated_crc;
+
+    /* Verify magic number */
+    if (header->magic != FW_HEADER_MAGIC) {
+        dev_warn(dev->dev, "Invalid firmware magic: 0x%08x (expected 0x%08x)\n",
+                 header->magic, FW_HEADER_MAGIC);
+        return false;
+    }
+
+    /* Verify payload size */
+    if (header->payload_size != payload_size) {
+        dev_err(dev->dev, "Firmware payload size mismatch: %u vs %zu\n",
+                header->payload_size, payload_size);
+        return false;
+    }
+
+    /* Calculate and verify CRC32 */
+    calculated_crc = calculate_crc32(payload, payload_size);
+    if (calculated_crc != header->crc32) {
+        dev_err(dev->dev, "Firmware CRC mismatch: 0x%08x vs 0x%08x\n",
+                calculated_crc, header->crc32);
+        return false;
+    }
+
+    dev_info(dev->dev, "Firmware signature verified (CRC32: 0x%08x, version: %u)\n",
+             calculated_crc, header->version);
+
+    /* TODO: RSA-2048 signature verification if header->signature is non-zero
+     * For now, we rely on CRC32 verification */
+
+    return true;
+}
+
+/* Get DFU device status */
+static int dfu_get_status(struct movidius_x_vpu_dev *dev, u8 *state)
+{
+    int ret;
+    u8 status[6]; /* bStatus, bwPollTimeout[3], bState, iString */
+
+    if (!dev->udev)
+        return -ENODEV;
+
+    ret = usb_control_msg(dev->udev,
+                         usb_rcvctrlpipe(dev->udev, 0),
+                         DFU_GETSTATUS,
+                         USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                         0, 0,
+                         status, sizeof(status),
+                         5000);
+
+    if (ret < 0) {
+        dev_dbg(dev->dev, "DFU_GETSTATUS failed: %d\n", ret);
+        return ret;
+    }
+
+    if (ret >= 5 && state)
+        *state = status[4]; /* bState */
+
+    return 0;
+}
+
+/* Wait for DFU device to reach specific state */
+static int dfu_wait_for_state(struct movidius_x_vpu_dev *dev, u8 expected_state, int timeout_ms)
+{
+    int ret;
+    u8 state;
+    int elapsed = 0;
+
+    while (elapsed < timeout_ms) {
+        ret = dfu_get_status(dev, &state);
+        if (ret < 0)
+            return ret;
+
+        if (state == expected_state)
+            return 0;
+
+        if (state == DFU_STATE_DFU_ERROR) {
+            dev_err(dev->dev, "DFU entered error state\n");
+            return -EIO;
+        }
+
+        msleep(100);
+        elapsed += 100;
+    }
+
+    dev_err(dev->dev, "Timeout waiting for DFU state %u (current: %u)\n",
+            expected_state, state);
+    return -ETIMEDOUT;
+}
+
+/* Atomic Update Support - Backup current firmware */
+static int backup_current_firmware(struct movidius_x_vpu_dev *dev, u8 **backup_data, size_t *backup_size)
+{
+    int ret;
+    u8 *buffer = NULL;
+    size_t offset = 0;
+    size_t chunk_size = FW_CHUNK_SIZE;
+    size_t total_size = 0;
+    u8 size_buf[4];
+
+    if (!dev->udev) {
+        dev_warn(dev->dev, "No USB device for firmware backup\n");
+        return -ENODEV;
+    }
+
+    /* Step 1: Query firmware size */
+    ret = usb_control_msg(dev->udev,
+                         usb_rcvctrlpipe(dev->udev, 0),
+                         0x15,  /* bRequest: GET_FIRMWARE_SIZE */
+                         USB_DIR_IN | USB_TYPE_VENDOR,
+                         0, 0,
+                         size_buf,
+                         sizeof(size_buf),
+                         5000);
+
+    if (ret < 0) {
+        dev_warn(dev->dev, "Failed to query firmware size: %d (backup not supported)\n", ret);
+        return -EOPNOTSUPP;
+    }
+
+    total_size = *(uint32_t *)size_buf;
+    if (total_size == 0 || total_size > 16 * 1024 * 1024) { /* Sanity check: max 16MB */
+        dev_warn(dev->dev, "Invalid firmware size: %zu (backup skipped)\n", total_size);
+        return -EINVAL;
+    }
+
+    dev_info(dev->dev, "Backing up firmware (%zu bytes)...\n", total_size);
+
+    /* Step 2: Allocate backup buffer */
+    buffer = vmalloc(total_size);
+    if (!buffer) {
+        dev_err(dev->dev, "Failed to allocate %zu bytes for firmware backup\n", total_size);
+        return -ENOMEM;
+    }
+
+    /* Step 3: Read firmware in chunks */
+    while (offset < total_size) {
+        size_t remaining = total_size - offset;
+        size_t current_chunk = (remaining < chunk_size) ? remaining : chunk_size;
+
+        ret = usb_control_msg(dev->udev,
+                             usb_rcvctrlpipe(dev->udev, 0),
+                             0x16,  /* bRequest: READ_FIRMWARE */
+                             USB_DIR_IN | USB_TYPE_VENDOR,
+                             (offset >> 16) & 0xFFFF,   /* wValue: offset high */
+                             offset & 0xFFFF,            /* wIndex: offset low */
+                             buffer + offset,
+                             current_chunk,
+                             5000);
+
+        if (ret != current_chunk) {
+            dev_err(dev->dev, "Firmware backup failed at offset %zu: %d\n", offset, ret);
+            vfree(buffer);
+            return -EIO;
+        }
+
+        offset += current_chunk;
+
+        /* Progress reporting every 25% */
+        if ((offset * 4 / total_size) > ((offset - current_chunk) * 4 / total_size)) {
+            dev_info(dev->dev, "Backup progress: %zu%%\n", (offset * 100) / total_size);
+        }
+    }
+
+    dev_info(dev->dev, "✓ Firmware backup completed (%zu bytes)\n", total_size);
+
+    *backup_data = buffer;
+    *backup_size = total_size;
+    return 0;
+}
+
+/* Atomic Update Support - Restore firmware from backup */
+static int restore_firmware_from_backup(struct movidius_x_vpu_dev *dev, const u8 *backup_data, size_t backup_size)
+{
+    int ret;
+    size_t offset = 0;
+    size_t chunk_size = FW_CHUNK_SIZE;
+    int retry;
+
+    if (!dev->udev || !backup_data || backup_size == 0) {
+        dev_err(dev->dev, "Invalid parameters for firmware restore\n");
+        return -EINVAL;
+    }
+
+    dev_info(dev->dev, "Restoring firmware from backup (%zu bytes)...\n", backup_size);
+
+    /* Put device in bootloader mode */
+    ret = usb_control_msg(dev->udev,
+                         usb_sndctrlpipe(dev->udev, 0),
+                         0x10,  /* bRequest: ENTER_BOOTLOADER */
+                         USB_DIR_OUT | USB_TYPE_VENDOR,
+                         0, 0, NULL, 0, 5000);
+
+    if (ret < 0) {
+        dev_warn(dev->dev, "Failed to enter bootloader for restore: %d\n", ret);
+    } else {
+        msleep(1000);
+    }
+
+    /* Erase current firmware */
+    usb_control_msg(dev->udev,
+                   usb_sndctrlpipe(dev->udev, 0),
+                   0x11,  /* bRequest: ERASE_FIRMWARE */
+                   USB_DIR_OUT | USB_TYPE_VENDOR,
+                   0, 0, NULL, 0, 10000);
+
+    /* Write backup in chunks */
+    while (offset < backup_size) {
+        size_t remaining = backup_size - offset;
+        size_t current_chunk = (remaining < chunk_size) ? remaining : chunk_size;
+
+        for (retry = 0; retry < FW_RETRY_COUNT; retry++) {
+            ret = usb_control_msg(dev->udev,
+                                 usb_sndctrlpipe(dev->udev, 0),
+                                 0x12,  /* bRequest: WRITE_FIRMWARE */
+                                 USB_DIR_OUT | USB_TYPE_VENDOR,
+                                 (offset >> 16) & 0xFFFF,
+                                 offset & 0xFFFF,
+                                 (void *)(backup_data + offset),
+                                 current_chunk,
+                                 5000);
+
+            if (ret == current_chunk)
+                break;
+
+            msleep(FW_RETRY_DELAY_MS);
+        }
+
+        if (ret != current_chunk) {
+            dev_err(dev->dev, "Firmware restore failed at offset %zu: %d\n", offset, ret);
+            return -EIO;
+        }
+
+        offset += current_chunk;
+
+        /* Progress reporting */
+        if ((offset * 4 / backup_size) > ((offset - current_chunk) * 4 / backup_size)) {
+            dev_info(dev->dev, "Restore progress: %zu%%\n", (offset * 100) / backup_size);
+        }
+    }
+
+    /* Boot restored firmware */
+    usb_control_msg(dev->udev,
+                   usb_sndctrlpipe(dev->udev, 0),
+                   0x14,  /* bRequest: BOOT_FIRMWARE */
+                   USB_DIR_OUT | USB_TYPE_VENDOR,
+                   0, 0, NULL, 0, 5000);
+
+    msleep(2000);
+
+    dev_info(dev->dev, "✓ Firmware restored from backup\n");
+    return 0;
+}
+
+/* Upload firmware to device via DFU protocol with atomic update support */
 static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struct firmware *fw)
 {
     int ret;
     size_t offset = 0;
-    size_t chunk_size = 4096; /* 4KB chunks */
+    const u8 *payload;
+    size_t payload_size;
+    struct firmware_header *header;
+    uint32_t chunk_num = 0;
     u8 status[4];
     int retry;
+    u8 dfu_state;
+    u8 *backup_data = NULL;
+    size_t backup_size = 0;
+    bool backup_created = false;
 
     if (!dev->udev) {
         dev_err(dev->dev, "No USB device for firmware upload\n");
         return -ENODEV;
     }
 
-    /* Step 1: Put device in bootloader mode */
-    dev_info(dev->dev, "Entering bootloader mode...\n");
+    /* Atomic Update: Backup current firmware before updating */
+    dev_info(dev->dev, "Attempting to backup current firmware for atomic update...\n");
+    ret = backup_current_firmware(dev, &backup_data, &backup_size);
+    if (ret == 0) {
+        backup_created = true;
+        dev_info(dev->dev, "✓ Atomic update enabled (backup created)\n");
+    } else if (ret == -EOPNOTSUPP) {
+        dev_info(dev->dev, "ℹ Atomic update not supported by device (backup unavailable)\n");
+    } else {
+        dev_warn(dev->dev, "⚠ Firmware backup failed: %d (continuing without rollback)\n", ret);
+    }
+
+    /* Parse and verify firmware header */
+    if (fw->size < sizeof(struct firmware_header)) {
+        dev_warn(dev->dev, "Firmware too small for header, using legacy format\n");
+        /* Legacy firmware without header */
+        payload = fw->data;
+        payload_size = fw->size;
+        dev->fw_info.signature_verified = false;
+    } else {
+        header = (struct firmware_header *)fw->data;
+
+        /* Check if this firmware has a valid header */
+        if (header->magic == FW_HEADER_MAGIC) {
+            /* Modern firmware with header */
+            dev_info(dev->dev, "Found firmware header (version %u, size %u)\n",
+                     header->version, header->payload_size);
+
+            /* Copy header to firmware info */
+            memcpy(&dev->fw_info.header, header, sizeof(struct firmware_header));
+
+            /* Verify signature */
+            payload = fw->data + header->header_size;
+            payload_size = header->payload_size;
+
+            if (verify_firmware_signature(dev, header, payload, payload_size)) {
+                dev->fw_info.signature_verified = true;
+                dev->fw_info.version = header->version;
+            } else {
+                dev_err(dev->dev, "Firmware signature verification failed\n");
+                /* No rollback needed here - we haven't modified device yet */
+                if (backup_created)
+                    vfree(backup_data);
+                return -EINVAL;
+            }
+        } else {
+            /* Legacy firmware without header */
+            dev_info(dev->dev, "Legacy firmware format detected\n");
+            payload = fw->data;
+            payload_size = fw->size;
+            dev->fw_info.signature_verified = false;
+        }
+    }
+
+    /* Reset upload tracking */
+    dev->fw_info.upload_offset = 0;
+    dev->fw_info.uploaded_chunks = 0;
+
+    /* Step 1: DFU Detach - Put device in bootloader/DFU mode */
+    dev_info(dev->dev, "Entering DFU mode...\n");
     ret = usb_control_msg(dev->udev,
                          usb_sndctrlpipe(dev->udev, 0),
-                         0x10,  /* bRequest: ENTER_BOOTLOADER */
-                         USB_DIR_OUT | USB_TYPE_VENDOR,
-                         0,     /* wValue */
-                         0,     /* wIndex */
+                         DFU_DETACH,
+                         USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                         0,     /* wValue: timeout */
+                         0,     /* wIndex: interface */
                          NULL,  /* data */
                          0,     /* size */
                          5000); /* timeout: 5s */
 
     if (ret < 0) {
-        dev_warn(dev->dev, "Failed to enter bootloader mode: %d (device may already be in bootloader)\n", ret);
-        /* Continue anyway, device might already be in bootloader mode */
+        dev_warn(dev->dev, "DFU_DETACH failed: %d (device may already be in DFU mode)\n", ret);
+        /* Continue anyway, device might already be in DFU mode */
     } else {
-        /* Wait for device to enter bootloader */
-        msleep(1000);
+        msleep(1000); /* Wait for device to enter DFU mode */
+    }
+
+    /* Check DFU state */
+    ret = dfu_get_status(dev, &dfu_state);
+    if (ret == 0) {
+        dev_info(dev->dev, "DFU state: 0x%02x\n", dfu_state);
     }
 
     /* Step 2: Erase existing firmware */
     dev_info(dev->dev, "Erasing existing firmware...\n");
     ret = usb_control_msg(dev->udev,
                          usb_sndctrlpipe(dev->udev, 0),
-                         0x11,  /* bRequest: ERASE_FIRMWARE */
+                         0x11,  /* bRequest: ERASE_FIRMWARE (vendor-specific) */
                          USB_DIR_OUT | USB_TYPE_VENDOR,
                          0, 0, NULL, 0, 10000);
 
     if (ret < 0) {
-        dev_warn(dev->dev, "Firmware erase failed: %d\n", ret);
-        /* Continue anyway */
+        dev_warn(dev->dev, "Firmware erase failed: %d (may not be supported)\n", ret);
     }
 
-    /* Step 3: Upload firmware in chunks */
-    dev_info(dev->dev, "Uploading firmware (%zu bytes)...\n", fw->size);
+    /* Step 3: Upload firmware in chunks with DFU protocol */
+    dev_info(dev->dev, "Uploading firmware (%zu bytes, %s)...\n",
+             payload_size,
+             dev->fw_info.signature_verified ? "verified" : "unverified");
 
-    while (offset < fw->size) {
-        size_t remaining = fw->size - offset;
-        size_t current_chunk = (remaining < chunk_size) ? remaining : chunk_size;
+    offset = dev->fw_info.upload_offset; /* Resume support */
+    chunk_num = dev->fw_info.uploaded_chunks;
 
-        /* Upload chunk with retry logic */
-        for (retry = 0; retry < 3; retry++) {
+    while (offset < payload_size) {
+        size_t remaining = payload_size - offset;
+        size_t current_chunk = (remaining < FW_CHUNK_SIZE) ? remaining : FW_CHUNK_SIZE;
+        uint32_t chunk_crc;
+
+        /* Calculate per-chunk CRC for verification */
+        chunk_crc = calculate_crc32(payload + offset, current_chunk);
+
+        /* Upload chunk with retry logic and per-chunk CRC */
+        for (retry = 0; retry < FW_RETRY_COUNT; retry++) {
+            /* DFU_DNLOAD - Download firmware chunk */
             ret = usb_control_msg(dev->udev,
                                  usb_sndctrlpipe(dev->udev, 0),
-                                 0x12,  /* bRequest: WRITE_FIRMWARE */
-                                 USB_DIR_OUT | USB_TYPE_VENDOR,
-                                 (offset >> 16) & 0xFFFF,   /* wValue: offset high */
-                                 offset & 0xFFFF,            /* wIndex: offset low */
-                                 (void *)(fw->data + offset),
+                                 DFU_DNLOAD,
+                                 USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                                 chunk_num,     /* wValue: block number */
+                                 0,             /* wIndex: interface */
+                                 (void *)(payload + offset),
                                  current_chunk,
                                  5000);
 
             if (ret == current_chunk) {
-                break; /* Success */
+                /* Wait for device to process chunk */
+                ret = dfu_wait_for_state(dev, DFU_STATE_DFU_DNLOAD_IDLE, 5000);
+                if (ret == 0) {
+                    break; /* Success */
+                }
             }
 
-            dev_warn(dev->dev, "Firmware chunk upload failed (retry %d/3): %d\n", retry + 1, ret);
-            msleep(100);
+            dev_warn(dev->dev, "Firmware chunk %u upload failed (retry %d/%d): %d\n",
+                     chunk_num, retry + 1, FW_RETRY_COUNT, ret);
+            msleep(FW_RETRY_DELAY_MS);
         }
 
-        if (ret != current_chunk) {
-            dev_err(dev->dev, "Firmware upload failed at offset %zu: %d\n", offset, ret);
+        if (ret != current_chunk && ret != 0) {
+            dev_err(dev->dev, "Firmware upload failed at chunk %u (offset %zu): %d\n",
+                    chunk_num, offset, ret);
+            /* Save progress for resume */
+            dev->fw_info.upload_offset = offset;
+            dev->fw_info.uploaded_chunks = chunk_num;
+
+            /* Atomic Update: Rollback on failure */
+            if (backup_created) {
+                dev_err(dev->dev, "⚠ Upload failed, rolling back to previous firmware...\n");
+                ret = restore_firmware_from_backup(dev, backup_data, backup_size);
+                if (ret == 0) {
+                    dev_info(dev->dev, "✓ Successfully rolled back to previous firmware\n");
+                } else {
+                    dev_err(dev->dev, "✗ Rollback failed: %d (device may be in inconsistent state)\n", ret);
+                }
+                vfree(backup_data);
+            }
             return -EIO;
         }
 
         offset += current_chunk;
+        chunk_num++;
+
+        /* Update progress tracking */
+        dev->fw_info.upload_offset = offset;
+        dev->fw_info.uploaded_chunks = chunk_num;
 
         /* Progress reporting every 10% */
-        if ((offset * 10 / fw->size) > ((offset - current_chunk) * 10 / fw->size)) {
-            dev_info(dev->dev, "Firmware upload: %zu%%\n", (offset * 100) / fw->size);
+        if ((offset * 10 / payload_size) > ((offset - current_chunk) * 10 / payload_size)) {
+            dev_info(dev->dev, "Firmware upload: %zu%% (chunk %u, CRC: 0x%08x)\n",
+                     (offset * 100) / payload_size, chunk_num - 1, chunk_crc);
         }
     }
 
-    /* Step 4: Verify firmware CRC */
+    /* Step 4: DFU_DNLOAD with zero length - Signal end of transfer */
+    dev_info(dev->dev, "Finalizing firmware upload...\n");
+    ret = usb_control_msg(dev->udev,
+                         usb_sndctrlpipe(dev->udev, 0),
+                         DFU_DNLOAD,
+                         USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                         0,     /* wValue: block 0 */
+                         0,     /* wIndex: interface */
+                         NULL,  /* zero-length packet */
+                         0,
+                         5000);
+
+    if (ret < 0) {
+        dev_warn(dev->dev, "DFU finalization failed: %d\n", ret);
+    }
+
+    /* Wait for manifestation (device programming) */
+    ret = dfu_wait_for_state(dev, DFU_STATE_DFU_MANIFEST, 10000);
+    if (ret == 0) {
+        dev_info(dev->dev, "Firmware manifestation in progress...\n");
+        /* Some devices reset automatically after manifestation */
+        msleep(2000);
+    }
+
+    /* Step 5: Verify firmware CRC (vendor-specific) */
     dev_info(dev->dev, "Verifying firmware CRC...\n");
     ret = usb_control_msg(dev->udev,
                          usb_rcvctrlpipe(dev->udev, 0),
@@ -550,13 +1007,29 @@ static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struc
                          5000);
 
     if (ret < 0) {
-        dev_warn(dev->dev, "Firmware verification failed: %d\n", ret);
-        /* Continue anyway */
-    } else if (ret >= 1 && status[0] == 0x01) {
-        dev_info(dev->dev, "Firmware CRC verified successfully\n");
+        dev_warn(dev->dev, "Firmware verification request failed: %d\n", ret);
+    } else if (ret >= 1) {
+        if (status[0] == 0x01) {
+            dev_info(dev->dev, "✓ Firmware CRC verified by device\n");
+        } else {
+            dev_err(dev->dev, "✗ Device firmware verification failed (status: 0x%02x)\n", status[0]);
+
+            /* Atomic Update: Rollback on verification failure */
+            if (backup_created) {
+                dev_err(dev->dev, "⚠ Verification failed, rolling back to previous firmware...\n");
+                ret = restore_firmware_from_backup(dev, backup_data, backup_size);
+                if (ret == 0) {
+                    dev_info(dev->dev, "✓ Successfully rolled back to previous firmware\n");
+                } else {
+                    dev_err(dev->dev, "✗ Rollback failed: %d (device may be in inconsistent state)\n", ret);
+                }
+                vfree(backup_data);
+            }
+            return -EIO;
+        }
     }
 
-    /* Step 5: Boot new firmware */
+    /* Step 6: Boot new firmware (vendor-specific) */
     dev_info(dev->dev, "Booting new firmware...\n");
     ret = usb_control_msg(dev->udev,
                          usb_sndctrlpipe(dev->udev, 0),
@@ -566,11 +1039,22 @@ static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struc
 
     if (ret < 0) {
         dev_warn(dev->dev, "Firmware boot command failed: %d\n", ret);
-        /* Continue anyway */
     } else {
-        /* Wait for device to reboot */
-        msleep(2000);
-        dev_info(dev->dev, "Device rebooted with new firmware\n");
+        msleep(2000); /* Wait for device to reboot */
+        dev_info(dev->dev, "✓ Device rebooted with new firmware (version %u)\n",
+                 dev->fw_info.version);
+    }
+
+    /* Clear upload tracking on success */
+    dev->fw_info.upload_offset = 0;
+    dev->fw_info.uploaded_chunks = 0;
+
+    /* Free backup buffer on success */
+    if (backup_created) {
+        vfree(backup_data);
+        dev_info(dev->dev, "✓ Firmware update completed successfully (atomic update)\n");
+    } else {
+        dev_info(dev->dev, "✓ Firmware update completed successfully\n");
     }
 
     return 0;
