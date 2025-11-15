@@ -582,6 +582,23 @@ cat /sys/class/movidius_x_vpu/movidius_x_vpu_0/movidius/performance_mode
 
 # Firmware
 cat /sys/class/movidius_x_vpu/movidius_x_vpu_0/movidius/firmware_version
+
+# Shared Memory Pool (NEW in v2.6) - Multi-device coordination
+cat /sys/class/movidius_x_vpu/movidius_x_vpu_0/movidius/pool_size
+# Output: 67108864 (64 MB)
+
+cat /sys/class/movidius_x_vpu/movidius_x_vpu_0/movidius/pool_bytes_allocated
+# Output: 2097152 (2 MB currently allocated)
+
+cat /sys/class/movidius_x_vpu/movidius_x_vpu_0/movidius/pool_utilization
+# Output: 3 (3% pool utilization)
+
+cat /sys/class/movidius_x_vpu/movidius_x_vpu_0/movidius/pool_peak_usage
+# Output: 4194304 (4 MB peak usage)
+
+cat /sys/class/movidius_x_vpu/movidius_x_vpu_0/movidius/pool_cached_firmware
+# Output: size=2097152 crc=0x12345678 refcount=3
+# (Firmware cached in shared pool, shared by 3 devices)
 ```
 
 ---
@@ -633,6 +650,9 @@ NUC2.1/
 - [x] **DMA burst size tuning (64-4096 bytes)**
 - [x] **Adaptive batch size auto-tuning**
 - [x] **Zlib compressed firmware support**
+- [x] **⭐ Cross-device memory sharing (64MB shared pool)**
+- [x] **⭐ Firmware caching with reference counting**
+- [x] **⭐ Lock-free bump allocator for pool management**
 - [x] Adaptive batching with tunable parameters
 - [x] Multi-device support with round-robin
 - [x] Runtime power management (PM autosuspend)
@@ -769,6 +789,16 @@ Contributions welcome! Key areas:
 - ✅ **Module parameter `default_perf_mode`** for boot-time mode selection
 - ✅ **Voltage control**: 1.0V-1.4V with comprehensive safety warnings
 - ✅ **Frequency control**: 400-1200 MHz across all SHAVE processors
+
+### Cross-Device Memory Sharing (NEW)
+- ✅ **64MB shared memory pool**: Allocated at driver load for multi-device coordination
+- ✅ **Lock-free bump allocator**: High-performance allocation with atomic operations
+- ✅ **Firmware caching**: Share single firmware copy across 2-8 devices (saves memory)
+- ✅ **Reference counting**: Automatic cache management with refcount tracking
+- ✅ **Sysfs monitoring**: Real-time pool usage, peak allocation, and cache statistics
+- ✅ **DMA-aligned allocations**: 64-byte alignment for optimal USB DMA performance
+- ✅ **Per-controller isolation**: Leverages VT-d/IOMMU for security in Xen/KVM environments
+- ✅ **Statistics tracking**: Total allocations, deallocations, and memory efficiency metrics
 
 ## Recent Enhancements (v2.5 - High-Performance Edition)
 

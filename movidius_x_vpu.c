@@ -144,8 +144,17 @@ enum perf_mode {
 
 /* Multi-Device Optimization */
 #define MAX_POOLED_DEVICES  8       /* Maximum devices in memory pool */
+#define MAX_USB_CONTROLLERS 4       /* Maximum USB controllers (per-controller pools) */
 #define WORK_STEAL_THRESHOLD 4      /* Queue depth to trigger work stealing */
 #define MIGRATION_COST_NS   50000   /* Cost of migrating task (50μs) */
+#define SAME_CONTROLLER_STEAL_PRIORITY 100  /* Priority boost for same-controller stealing */
+
+/* USB Bandwidth Limits (MB/s) */
+#define USB_30_THEORETICAL_MBPS  5000  /* USB 3.0: 5 Gbps = 625 MB/s theoretical */
+#define USB_30_PRACTICAL_MBPS    400   /* Practical limit: ~400 MB/s */
+#define USB_BANDWIDTH_WARN_PCT   75    /* Warn at 75% utilization (300 MB/s) */
+#define USB_BANDWIDTH_CRIT_PCT   90    /* Critical at 90% utilization (360 MB/s) */
+#define BANDWIDTH_CHECK_INTERVAL_MS 1000  /* Check bandwidth every 1 second */
 
 /* DMA Performance Tuning */
 #define DMA_BURST_SIZE_MIN  64      /* Minimum DMA burst size (bytes) */
@@ -463,17 +472,41 @@ struct movidius_x_vpu_dev {
     struct list_head global_list;
 
     /* Multi-Device Coordination */
-    struct device_pool *pool;        /* Shared memory pool */
+    struct device_pool *pool;        /* Shared memory pool (per-controller) */
     atomic_t pool_id;                /* ID in pool */
     atomic64_t stolen_tasks;         /* Tasks stolen from this device */
     atomic64_t donated_tasks;        /* Tasks donated to other devices */
+
+    /* USB Controller & DMA Topology */
+    int controller_id;               /* USB controller index (0-3) */
+    int usb_busnum;                  /* USB bus number */
+    char controller_pci[16];         /* PCI address (e.g., "00:14.0") */
+    int iommu_group;                 /* IOMMU group number (-1 if none) */
+    atomic64_t same_controller_steals;   /* Work stolen from same controller */
+    atomic64_t cross_controller_steals;  /* Work stolen across controllers */
 };
 
-/* Multi-Device Memory Pool */
+/* Multi-Device Memory Pool (Per USB Controller) */
 struct device_pool {
     spinlock_t lock;
     struct movidius_x_vpu_dev *devices[MAX_POOLED_DEVICES];
     int device_count;
+
+    /* USB Controller Identification */
+    int controller_id;           /* USB controller index (0-3) */
+    char controller_pci[16];     /* PCI address (e.g., "00:14.0") */
+    int controller_busnum;       /* USB bus number */
+    bool active;                 /* Pool is initialized and active */
+    int numa_node;               /* NUMA node of USB controller (-1 if unknown) */
+    int iommu_group;             /* IOMMU group of controller */
+
+    /* USB Bandwidth Monitoring */
+    atomic64_t total_bytes_transferred;  /* Total bytes through this controller */
+    atomic64_t bytes_last_second;        /* Bytes transferred in last second */
+    uint64_t last_bandwidth_check;       /* jiffies of last bandwidth check */
+    uint32_t current_bandwidth_mbps;     /* Current bandwidth utilization (MB/s) */
+    uint32_t peak_bandwidth_mbps;        /* Peak bandwidth observed */
+    atomic_t bandwidth_warnings;         /* Count of bandwidth saturation warnings */
 
     /* Shared memory arena */
     void *shared_memory;
@@ -493,6 +526,18 @@ struct device_pool {
     atomic64_t total_migrations;
     atomic64_t total_stolen;
     atomic64_t pool_throughput;
+
+    /* Memory pool statistics */
+    atomic64_t total_allocations;
+    atomic64_t total_deallocations;
+    atomic64_t bytes_allocated;
+    atomic64_t peak_usage;
+
+    /* Firmware caching */
+    void *cached_firmware;
+    size_t cached_firmware_size;
+    uint32_t cached_firmware_crc;
+    atomic_t firmware_refcount;
 };
 
 /* Work item for cross-device migration */
@@ -512,12 +557,15 @@ static dev_t movidius_devt;
 static DEFINE_IDA(movidius_minor_ida);
 static atomic_t global_device_count = ATOMIC_INIT(0);
 
-/* Global Device Pool for Multi-Stick Coordination */
-static struct device_pool global_pool = {
-    .device_count = 0,
-    .shared_size = 64 * 1024 * 1024,  /* 64MB shared pool */
-};
-static DEFINE_SPINLOCK(global_pool_lock);
+/* Per-Controller Device Pools for DMA-Topology-Aware Coordination */
+static struct device_pool controller_pools[MAX_USB_CONTROLLERS];
+static DEFINE_SPINLOCK(controller_pools_lock);
+static int active_controller_count = 0;
+
+/* Virtualization & NUMA Detection */
+static bool running_on_hypervisor = false;
+static const char *hypervisor_type = "none";
+static bool numa_available = false;
 
 /* Forward declarations for device-dependent functions */
 static int upload_firmware_to_device(struct movidius_x_vpu_dev *dev, const struct firmware *fw);
@@ -1001,17 +1049,30 @@ static struct movidius_x_vpu_dev *find_least_loaded_device(struct device_pool *p
 }
 
 /* Steal work from overloaded devices */
+/**
+ * try_steal_work - Controller-aware work stealing with priority levels
+ * @thief_dev: Device attempting to steal work
+ *
+ * Priority levels:
+ * 1. Same USB controller (same IOMMU group, shared DMA domain) - PREFERRED
+ * 2. Different controller (cross-DMA domain) - FALLBACK
+ *
+ * Returns number of tasks stolen.
+ */
 static int try_steal_work(struct movidius_x_vpu_dev *thief_dev)
 {
     struct device_pool *pool = thief_dev->pool;
     struct movidius_x_vpu_dev *victim_dev = NULL;
+    struct movidius_x_vpu_dev *cross_controller_victim = NULL;
     uint64_t max_queue = 0;
-    int i, stolen = 0;
+    uint64_t max_cross_queue = 0;
+    int i, j, stolen = 0;
+    bool same_controller = false;
 
     if (!pool || !enable_work_stealing)
         return 0;
 
-    /* Find most loaded device */
+    /* Phase 1: Find most loaded device in SAME controller pool (preferred) */
     spin_lock(&pool->lock);
     for (i = 0; i < pool->device_count; i++) {
         struct movidius_x_vpu_dev *dev = pool->devices[i];
@@ -1024,34 +1085,89 @@ static int try_steal_work(struct movidius_x_vpu_dev *thief_dev)
         if (queue_depth > max_queue && queue_depth > WORK_STEAL_THRESHOLD) {
             max_queue = queue_depth;
             victim_dev = dev;
+            same_controller = true;
         }
     }
     spin_unlock(&pool->lock);
 
+    /* Phase 2: If no same-controller victim, check OTHER controller pools */
+    if (!victim_dev) {
+        unsigned long flags;
+
+        spin_lock_irqsave(&controller_pools_lock, flags);
+        for (i = 0; i < MAX_USB_CONTROLLERS; i++) {
+            struct device_pool *other_pool = &controller_pools[i];
+
+            if (!other_pool->active || other_pool == pool)
+                continue;
+
+            spin_lock(&other_pool->lock);
+            for (j = 0; j < other_pool->device_count; j++) {
+                struct movidius_x_vpu_dev *dev = other_pool->devices[j];
+                uint64_t queue_depth;
+
+                if (!dev)
+                    continue;
+
+                queue_depth = atomic64_read(&dev->stats.queue_depth);
+                /* Higher threshold for cross-controller stealing (2x) */
+                if (queue_depth > max_cross_queue && queue_depth > (WORK_STEAL_THRESHOLD * 2)) {
+                    max_cross_queue = queue_depth;
+                    cross_controller_victim = dev;
+                }
+            }
+            spin_unlock(&other_pool->lock);
+        }
+        spin_unlock_irqrestore(&controller_pools_lock, flags);
+
+        if (cross_controller_victim) {
+            victim_dev = cross_controller_victim;
+            max_queue = max_cross_queue;
+            same_controller = false;
+        }
+    }
+
+    /* Execute steal if victim found */
     if (victim_dev && max_queue > WORK_STEAL_THRESHOLD) {
         /* Steal half of victim's queue */
         int steal_count = max_queue / 2;
         struct migratable_work *work, *tmp;
+        struct device_pool *victim_pool = victim_dev->pool;
 
-        spin_lock(&pool->work_queue_lock);
-        list_for_each_entry_safe(work, tmp, &pool->global_work_queue, list) {
+        if (!victim_pool)
+            return 0;
+
+        spin_lock(&victim_pool->work_queue_lock);
+        list_for_each_entry_safe(work, tmp, &victim_pool->global_work_queue, list) {
             if (work->source_dev == victim_dev && stolen < steal_count) {
                 list_del(&work->list);
                 /* Transfer to thief's queue */
                 atomic64_inc(&thief_dev->stolen_tasks);
                 atomic64_inc(&victim_dev->donated_tasks);
                 atomic64_inc(&pool->total_stolen);
+
+                /* Track same-controller vs cross-controller steals */
+                if (same_controller) {
+                    atomic64_inc(&thief_dev->same_controller_steals);
+                } else {
+                    atomic64_inc(&thief_dev->cross_controller_steals);
+                }
+
                 stolen++;
                 kfree(work);
             }
         }
-        spin_unlock(&pool->work_queue_lock);
+        spin_unlock(&victim_pool->work_queue_lock);
 
         if (stolen > 0) {
-            pr_info("Device %d stole %d tasks from device %d (queue: %llu -> %llu)\n",
+            pr_info("%s: Device %d (%s) stole %d tasks from device %d (%s) [%s-controller, queue: %llu -> %llu]\n",
+                    same_controller ? "SAME_CTRL" : "CROSS_CTRL",
                     atomic_read(&thief_dev->pool_id),
+                    thief_dev->controller_pci,
                     stolen,
                     atomic_read(&victim_dev->pool_id),
+                    victim_dev->controller_pci,
+                    same_controller ? "same" : "cross",
                     max_queue, max_queue - stolen);
         }
     }
@@ -1059,65 +1175,781 @@ static int try_steal_work(struct movidius_x_vpu_dev *thief_dev)
     return stolen;
 }
 
-/* Add device to global pool */
+/* ========== USB Controller & IOMMU Topology Detection ========== */
+
+/**
+ * detect_usb_controller - Detect USB controller PCI address and bus number
+ * @dev: Device to inspect
+ *
+ * Reads USB topology from sysfs to identify the USB controller (PCI address).
+ * This enables per-controller pool allocation matching hardware DMA isolation.
+ */
+static int detect_usb_controller(struct movidius_x_vpu_dev *dev)
+{
+    struct usb_device *udev = dev->udev;
+    struct usb_device *root_hub;
+    struct device *controller_dev;
+    const char *pci_name;
+
+    if (!udev) {
+        dev_err(dev->dev, "No USB device available\n");
+        return -ENODEV;
+    }
+
+    /* Get USB bus number (unique per controller) */
+    dev->usb_busnum = udev->bus->busnum;
+
+    /* Find root hub (parent of all devices on this controller) */
+    root_hub = udev;
+    while (root_hub->parent)
+        root_hub = root_hub->parent;
+
+    /* Get controller device (PCI device) */
+    controller_dev = root_hub->bus->controller;
+    if (!controller_dev) {
+        dev_warn(dev->dev, "Cannot find USB controller device\n");
+        snprintf(dev->controller_pci, sizeof(dev->controller_pci), "unknown");
+        return -ENODEV;
+    }
+
+    /* Extract PCI address (e.g., "0000:00:14.0") */
+    pci_name = dev_name(controller_dev);
+    if (pci_name) {
+        /* Copy PCI address, skip "0000:" prefix if present */
+        if (strlen(pci_name) > 5 && pci_name[4] == ':') {
+            snprintf(dev->controller_pci, sizeof(dev->controller_pci), "%s", pci_name + 5);
+        } else {
+            snprintf(dev->controller_pci, sizeof(dev->controller_pci), "%s", pci_name);
+        }
+    } else {
+        snprintf(dev->controller_pci, sizeof(dev->controller_pci), "unknown");
+    }
+
+    dev_info(dev->dev, "USB Controller: %s (bus %d)\n", dev->controller_pci, dev->usb_busnum);
+
+    return 0;
+}
+
+/**
+ * detect_iommu_group - Detect IOMMU group for DMA isolation visibility
+ * @dev: Device to inspect
+ *
+ * Reads IOMMU group from sysfs. Devices in the same IOMMU group share DMA
+ * address space (hardware trust boundary). Typically matches USB controller.
+ */
+static int detect_iommu_group(struct movidius_x_vpu_dev *dev)
+{
+    struct device *usb_dev = &dev->udev->dev;
+    struct iommu_group *group;
+    int group_id = -1;
+
+    /* Check if IOMMU is active */
+    group = iommu_group_get(usb_dev);
+    if (group) {
+        group_id = iommu_group_id(group);
+        iommu_group_put(group);
+        dev->iommu_group = group_id;
+        dev_info(dev->dev, "IOMMU Group: %d (DMA isolated per-controller)\n", group_id);
+    } else {
+        dev->iommu_group = -1;
+        dev_info(dev->dev, "IOMMU: Not active or not supported\n");
+    }
+
+    return 0;
+}
+
+/**
+ * detect_hypervisor - Detect if running under hypervisor (Xen/KVM/VMware)
+ *
+ * Checks for virtualization and sets global flags for optimization.
+ * Xen/KVM guests may have different DMA characteristics.
+ */
+static void detect_hypervisor(void)
+{
+    /* Check /sys/hypervisor/type */
+    struct file *f;
+    char buf[32];
+    loff_t pos = 0;
+    ssize_t ret;
+
+    f = filp_open("/sys/hypervisor/type", O_RDONLY, 0);
+    if (!IS_ERR(f)) {
+        ret = kernel_read(f, buf, sizeof(buf) - 1, &pos);
+        if (ret > 0) {
+            buf[ret] = '\0';
+            /* Remove trailing newline */
+            if (buf[ret-1] == '\n')
+                buf[ret-1] = '\0';
+
+            if (strcmp(buf, "xen") == 0) {
+                running_on_hypervisor = true;
+                hypervisor_type = "xen";
+                pr_info("✓ Xen hypervisor detected (PCI passthrough optimizations enabled)\n");
+            } else if (strstr(buf, "kvm")) {
+                running_on_hypervisor = true;
+                hypervisor_type = "kvm";
+                pr_info("✓ KVM hypervisor detected\n");
+            }
+        }
+        filp_close(f, NULL);
+    }
+
+    /* Fallback: Check CPU vendor ID for hypervisor signatures */
+    if (!running_on_hypervisor) {
+#ifdef CONFIG_X86
+        unsigned int eax, ebx, ecx, edx;
+        char signature[13];
+
+        /* CPUID leaf 0x40000000: Hypervisor vendor */
+        cpuid(0x40000000, &eax, &ebx, &ecx, &edx);
+        memcpy(signature, &ebx, 4);
+        memcpy(signature + 4, &ecx, 4);
+        memcpy(signature + 8, &edx, 4);
+        signature[12] = '\0';
+
+        if (strcmp(signature, "XenVMMXenVMM") == 0) {
+            running_on_hypervisor = true;
+            hypervisor_type = "xen";
+            pr_info("✓ Xen detected via CPUID\n");
+        } else if (strcmp(signature, "KVMKVMKVM") == 0) {
+            running_on_hypervisor = true;
+            hypervisor_type = "kvm";
+            pr_info("✓ KVM detected via CPUID\n");
+        } else if (strcmp(signature, "VMwareVMware") == 0) {
+            running_on_hypervisor = true;
+            hypervisor_type = "vmware";
+            pr_info("✓ VMware detected via CPUID\n");
+        }
+#endif
+    }
+
+    if (!running_on_hypervisor) {
+        pr_info("Running on bare metal (no hypervisor detected)\n");
+    }
+}
+
+/**
+ * detect_numa_node - Detect NUMA node of USB controller
+ * @controller_dev: USB controller device
+ *
+ * Returns NUMA node ID or -1 if NUMA not available/supported.
+ */
+static int detect_numa_node(struct device *controller_dev)
+{
+    int node = -1;
+
+#ifdef CONFIG_NUMA
+    if (num_online_nodes() > 1) {
+        node = dev_to_node(controller_dev);
+        if (node >= 0) {
+            numa_available = true;
+            pr_info("USB controller on NUMA node %d\n", node);
+        } else {
+            pr_debug("NUMA node unknown for controller\n");
+        }
+    } else {
+        pr_debug("NUMA not applicable (single node system)\n");
+    }
+#else
+    pr_debug("NUMA support not compiled in kernel\n");
+#endif
+
+    return node;
+}
+
+/**
+ * update_bandwidth_stats - Update USB controller bandwidth statistics
+ * @pool: Controller pool to update
+ * @bytes: Bytes transferred in this operation
+ *
+ * Tracks bandwidth usage and warns if controller is saturated.
+ */
+static void update_bandwidth_stats(struct device_pool *pool, size_t bytes)
+{
+    uint64_t now, elapsed_ms;
+    uint64_t bytes_this_second;
+    uint32_t bandwidth_mbps, utilization_pct;
+
+    if (!pool)
+        return;
+
+    /* Update total */
+    atomic64_add(bytes, &pool->total_bytes_transferred);
+    atomic64_add(bytes, &pool->bytes_last_second);
+
+    now = jiffies;
+    elapsed_ms = jiffies_to_msecs(now - pool->last_bandwidth_check);
+
+    /* Check bandwidth every ~1 second */
+    if (elapsed_ms >= BANDWIDTH_CHECK_INTERVAL_MS) {
+        bytes_this_second = atomic64_xchg(&pool->bytes_last_second, 0);
+        bandwidth_mbps = (bytes_this_second / 1024 / 1024);  /* Convert to MB/s */
+
+        pool->current_bandwidth_mbps = bandwidth_mbps;
+        if (bandwidth_mbps > pool->peak_bandwidth_mbps) {
+            pool->peak_bandwidth_mbps = bandwidth_mbps;
+        }
+
+        pool->last_bandwidth_check = now;
+
+        /* Calculate utilization percentage */
+        utilization_pct = (bandwidth_mbps * 100) / USB_30_PRACTICAL_MBPS;
+
+        /* Warn if approaching saturation */
+        if (utilization_pct >= USB_BANDWIDTH_CRIT_PCT) {
+            atomic_inc(&pool->bandwidth_warnings);
+            pr_warn("⚠ USB controller %s: CRITICAL bandwidth usage: %u MB/s (%u%% of %u MB/s)\n",
+                    pool->controller_pci, bandwidth_mbps, utilization_pct, USB_30_PRACTICAL_MBPS);
+            pr_warn("   Consider distributing devices across multiple controllers\n");
+        } else if (utilization_pct >= USB_BANDWIDTH_WARN_PCT) {
+            pr_info("USB controller %s: High bandwidth usage: %u MB/s (%u%%)\n",
+                    pool->controller_pci, bandwidth_mbps, utilization_pct);
+        }
+    }
+}
+
+/**
+ * report_iommu_topology - Report detailed IOMMU topology for Xen admins
+ * @pool: Controller pool to report
+ *
+ * Provides detailed visibility into DMA isolation for virtualization planning.
+ */
+static void report_iommu_topology(struct device_pool *pool)
+{
+    int i;
+    bool all_same_group = true;
+    int first_group = -1;
+
+    if (!pool || pool->device_count == 0)
+        return;
+
+    pr_info("========== IOMMU Topology for Controller %s ==========\n", pool->controller_pci);
+    pr_info("  Controller IOMMU Group: %d\n", pool->iommu_group);
+    pr_info("  NUMA Node:              %d %s\n", pool->numa_node,
+            pool->numa_node >= 0 ? "" : "(unknown/not applicable)");
+    pr_info("  Devices in pool:        %d\n", pool->device_count);
+
+    /* Check if all devices are in same IOMMU group */
+    for (i = 0; i < pool->device_count; i++) {
+        struct movidius_x_vpu_dev *dev = pool->devices[i];
+        if (!dev)
+            continue;
+
+        if (first_group == -1) {
+            first_group = dev->iommu_group;
+        } else if (dev->iommu_group != first_group) {
+            all_same_group = false;
+        }
+
+        pr_info("    Device %d: IOMMU group %d, PCI %s\n",
+                i, dev->iommu_group, dev->controller_pci);
+    }
+
+    if (all_same_group && first_group >= 0) {
+        pr_info("  ✓ All devices in IOMMU group %d (safe for shared pool)\n", first_group);
+    } else if (!all_same_group) {
+        pr_warn("  ⚠ Devices span multiple IOMMU groups (unexpected!)\n");
+        pr_warn("     This may indicate USB hub or topology issue\n");
+    }
+
+    if (running_on_hypervisor) {
+        pr_info("  Hypervisor: %s\n", hypervisor_type);
+        pr_info("  ✓ For PCI passthrough: Assign entire controller %s to VM\n",
+                pool->controller_pci);
+        pr_info("     All %d devices will be DMA-isolated in target VM\n",
+                pool->device_count);
+    }
+
+    pr_info("========================================================\n");
+}
+
+/**
+ * find_or_create_controller_pool - Find existing pool or create new one
+ * @controller_pci: PCI address of USB controller (e.g., "00:14.0")
+ * @busnum: USB bus number
+ *
+ * Returns pool for this controller, creating if necessary.
+ * Each USB controller gets its own 64MB pool matching hardware DMA domains.
+ */
+static struct device_pool *find_or_create_controller_pool(const char *controller_pci, int busnum)
+{
+    unsigned long flags;
+    struct device_pool *pool = NULL;
+    int i;
+
+    spin_lock_irqsave(&controller_pools_lock, flags);
+
+    /* Search for existing pool for this controller */
+    for (i = 0; i < MAX_USB_CONTROLLERS; i++) {
+        if (controller_pools[i].active &&
+            strcmp(controller_pools[i].controller_pci, controller_pci) == 0) {
+            pool = &controller_pools[i];
+            goto out;
+        }
+    }
+
+    /* Need to create new pool - find empty slot */
+    for (i = 0; i < MAX_USB_CONTROLLERS; i++) {
+        if (!controller_pools[i].active) {
+            pool = &controller_pools[i];
+
+            /* Initialize pool */
+            spin_lock_init(&pool->lock);
+            pool->controller_id = i;
+            snprintf(pool->controller_pci, sizeof(pool->controller_pci), "%s", controller_pci);
+            pool->controller_busnum = busnum;
+            pool->device_count = 0;
+            pool->shared_size = 64 * 1024 * 1024;  /* 64MB per controller */
+
+            INIT_LIST_HEAD(&pool->global_work_queue);
+            spin_lock_init(&pool->work_queue_lock);
+            init_waitqueue_head(&pool->work_available);
+
+            atomic_set(&pool->allocation_offset, 0);
+            atomic_set(&pool->round_robin_index, 0);
+            atomic64_set(&pool->total_migrations, 0);
+            atomic64_set(&pool->total_stolen, 0);
+            atomic64_set(&pool->pool_throughput, 0);
+            atomic64_set(&pool->total_allocations, 0);
+            atomic64_set(&pool->total_deallocations, 0);
+            atomic64_set(&pool->bytes_allocated, 0);
+            atomic64_set(&pool->peak_usage, 0);
+
+            pool->cached_firmware = NULL;
+            pool->cached_firmware_size = 0;
+            pool->cached_firmware_crc = 0;
+            atomic_set(&pool->firmware_refcount, 0);
+
+            /* Initialize bandwidth monitoring */
+            atomic64_set(&pool->total_bytes_transferred, 0);
+            atomic64_set(&pool->bytes_last_second, 0);
+            pool->last_bandwidth_check = jiffies;
+            pool->current_bandwidth_mbps = 0;
+            pool->peak_bandwidth_mbps = 0;
+            atomic_set(&pool->bandwidth_warnings, 0);
+
+            /* Initialize NUMA node (will be set when first device added) */
+            pool->numa_node = -1;
+            pool->iommu_group = -1;
+
+            /* Allocate shared memory for this controller (NUMA-aware if available) */
+            if (enable_memory_pooling) {
+#ifdef CONFIG_NUMA
+                if (numa_available && pool->numa_node >= 0) {
+                    /* NUMA-aware allocation on same node as USB controller */
+                    pool->shared_memory = vmalloc_node(pool->shared_size, pool->numa_node);
+                    if (pool->shared_memory) {
+                        memset(pool->shared_memory, 0, pool->shared_size);
+                        pr_info("✓ Created 64MB NUMA-aware pool on node %d for controller %s\n",
+                                pool->numa_node, controller_pci);
+                    }
+                } else
+#endif
+                {
+                    /* Standard allocation (single-node or NUMA not available) */
+                    pool->shared_memory = vmalloc(pool->shared_size);
+                    if (pool->shared_memory) {
+                        memset(pool->shared_memory, 0, pool->shared_size);
+                        pr_info("✓ Created 64MB pool for USB controller %s (pool ID %d)\n",
+                                controller_pci, i);
+                    }
+                }
+
+                if (!pool->shared_memory) {
+                    pr_warn("Failed to allocate pool for controller %s\n", controller_pci);
+                    pool->shared_size = 0;
+                }
+            }
+
+            pool->active = true;
+            active_controller_count++;
+            goto out;
+        }
+    }
+
+    /* No free slots */
+    pr_err("Maximum USB controllers (%d) reached, cannot create pool for %s\n",
+           MAX_USB_CONTROLLERS, controller_pci);
+    pool = NULL;
+
+out:
+    spin_unlock_irqrestore(&controller_pools_lock, flags);
+    return pool;
+}
+
+/* Add device to controller-specific pool */
 static int add_device_to_pool(struct movidius_x_vpu_dev *dev)
 {
+    struct device_pool *pool;
     unsigned long flags;
     int ret = 0;
 
     if (!enable_memory_pooling)
         return 0;
 
-    spin_lock_irqsave(&global_pool_lock, flags);
+    /* Detect USB controller topology */
+    ret = detect_usb_controller(dev);
+    if (ret < 0) {
+        dev_warn(dev->dev, "Failed to detect USB controller, skipping pool\n");
+        return ret;
+    }
 
-    if (global_pool.device_count >= MAX_POOLED_DEVICES) {
-        dev_warn(dev->dev, "Device pool full (%d devices)\n", MAX_POOLED_DEVICES);
+    /* Detect IOMMU group for DMA isolation visibility */
+    detect_iommu_group(dev);
+
+    /* Find or create pool for this USB controller */
+    pool = find_or_create_controller_pool(dev->controller_pci, dev->usb_busnum);
+    if (!pool) {
+        dev_err(dev->dev, "Failed to find/create pool for controller %s\n",
+                dev->controller_pci);
+        return -ENOMEM;
+    }
+
+    spin_lock_irqsave(&pool->lock, flags);
+
+    /* On first device, detect NUMA node and IOMMU group of controller */
+    if (pool->device_count == 0) {
+        struct usb_device *root_hub = dev->udev;
+        struct device *controller_dev;
+
+        /* Find root hub to get controller device */
+        while (root_hub->parent)
+            root_hub = root_hub->parent;
+
+        controller_dev = root_hub->bus->controller;
+        if (controller_dev) {
+            pool->numa_node = detect_numa_node(controller_dev);
+
+            /* Get controller's IOMMU group (may differ from individual devices) */
+            #ifdef CONFIG_IOMMU_API
+            struct iommu_group *group = iommu_group_get(controller_dev);
+            if (group) {
+                pool->iommu_group = iommu_group_id(group);
+                iommu_group_put(group);
+            }
+            #endif
+        }
+    }
+
+    if (pool->device_count >= MAX_POOLED_DEVICES) {
+        dev_warn(dev->dev, "Pool for controller %s is full (%d devices)\n",
+                 dev->controller_pci, MAX_POOLED_DEVICES);
         ret = -ENOSPC;
         goto out;
     }
 
-    global_pool.devices[global_pool.device_count] = dev;
-    atomic_set(&dev->pool_id, global_pool.device_count);
-    global_pool.device_count++;
-    dev->pool = &global_pool;
+    pool->devices[pool->device_count] = dev;
+    atomic_set(&dev->pool_id, pool->device_count);
+    pool->device_count++;
+    dev->pool = pool;
+    dev->controller_id = pool->controller_id;
 
-    dev_info(dev->dev, "✓ Added to device pool (pool size: %d)\n",
-             global_pool.device_count);
+    dev_info(dev->dev, "✓ Added to pool for controller %s (pool has %d device(s), IOMMU group %d)\n",
+             dev->controller_pci, pool->device_count, dev->iommu_group);
+
+    /* Report detailed IOMMU topology when pool becomes multi-device */
+    if (pool->device_count == 2) {
+        spin_unlock_irqrestore(&pool->lock, flags);
+        report_iommu_topology(pool);
+        return 0;  /* Success, already unlocked */
+    }
 
 out:
-    spin_unlock_irqrestore(&global_pool_lock, flags);
+    spin_unlock_irqsave(&pool->lock, flags);
     return ret;
 }
 
-/* Remove device from global pool */
+/* Remove device from controller-specific pool */
 static void remove_device_from_pool(struct movidius_x_vpu_dev *dev)
 {
+    struct device_pool *pool = dev->pool;
     unsigned long flags;
     int i;
 
-    if (!dev->pool)
+    if (!pool)
         return;
 
-    spin_lock_irqsave(&global_pool_lock, flags);
+    spin_lock_irqsave(&pool->lock, flags);
 
     /* Find and remove device from pool */
-    for (i = 0; i < global_pool.device_count; i++) {
-        if (global_pool.devices[i] == dev) {
+    for (i = 0; i < pool->device_count; i++) {
+        if (pool->devices[i] == dev) {
             /* Shift remaining devices */
-            for (; i < global_pool.device_count - 1; i++) {
-                global_pool.devices[i] = global_pool.devices[i + 1];
-                atomic_set(&global_pool.devices[i]->pool_id, i);
+            for (; i < pool->device_count - 1; i++) {
+                pool->devices[i] = pool->devices[i + 1];
+                atomic_set(&pool->devices[i]->pool_id, i);
             }
-            global_pool.devices[global_pool.device_count - 1] = NULL;
-            global_pool.device_count--;
-            dev_info(dev->dev, "Removed from device pool (%d device(s) remaining)\n",
-                     global_pool.device_count);
+            pool->devices[pool->device_count - 1] = NULL;
+            pool->device_count--;
+            dev_info(dev->dev, "Removed from pool for controller %s (%d device(s) remaining)\n",
+                     dev->controller_pci, pool->device_count);
             break;
         }
     }
 
-    spin_unlock_irqrestore(&global_pool_lock, flags);
+    spin_unlock_irqsave(&pool->lock, flags);
     dev->pool = NULL;
+}
+
+/* ========== Shared Memory Pool Functions ========== */
+
+/**
+ * pool_alloc - Allocate memory from the shared device pool
+ * @pool: Pool to allocate from (controller-specific)
+ * @size: Size in bytes to allocate
+ * @align: Alignment requirement (must be power of 2)
+ *
+ * Returns pointer to allocated memory, or NULL if pool is exhausted.
+ * Uses lock-free bump allocator for high performance.
+ */
+static void *pool_alloc(struct device_pool *pool, size_t size, size_t align)
+{
+    int offset, new_offset, aligned_offset;
+    void *ptr;
+    uint64_t current_usage, peak;
+
+    if (!pool || !pool->shared_memory || !enable_memory_pooling)
+        return NULL;
+
+    if (size == 0 || size > pool->shared_size)
+        return NULL;
+
+    /* Ensure alignment is power of 2 */
+    if (align == 0)
+        align = 8;  /* Default 8-byte alignment */
+    if (align & (align - 1))
+        return NULL;  /* Not power of 2 */
+
+    do {
+        offset = atomic_read(&pool->allocation_offset);
+
+        /* Align offset */
+        aligned_offset = (offset + align - 1) & ~(align - 1);
+        new_offset = aligned_offset + size;
+
+        /* Check if allocation would exceed pool size */
+        if (new_offset > pool->shared_size) {
+            pr_warn("Pool %s exhausted (requested %zu bytes, available %zu bytes)\n",
+                    pool->controller_pci, size, pool->shared_size - offset);
+            return NULL;
+        }
+
+    } while (atomic_cmpxchg(&pool->allocation_offset, offset, new_offset) != offset);
+
+    ptr = (char *)pool->shared_memory + aligned_offset;
+
+    /* Update statistics */
+    atomic64_inc(&pool->total_allocations);
+    current_usage = atomic64_add_return(size, &pool->bytes_allocated);
+
+    /* Update peak usage */
+    do {
+        peak = atomic64_read(&pool->peak_usage);
+        if (current_usage <= peak)
+            break;
+    } while (atomic64_cmpxchg(&pool->peak_usage, peak, current_usage) != peak);
+
+    pr_debug("Pool %s allocated %zu bytes at offset %d (total usage: %llu bytes, %.1f%%)\n",
+             pool->controller_pci, size, aligned_offset, current_usage,
+             (current_usage * 100.0) / pool->shared_size);
+
+    return ptr;
+}
+
+/**
+ * pool_free - Free memory allocated from the shared pool
+ * @pool: Pool to free from
+ * @ptr: Pointer to memory to free
+ * @size: Size of the allocation
+ *
+ * Note: Current implementation uses a bump allocator, so memory is not
+ * actually reclaimed until pool reset. This tracks deallocation statistics.
+ */
+static void pool_free(struct device_pool *pool, void *ptr, size_t size)
+{
+    if (!pool || !ptr || !pool->shared_memory)
+        return;
+
+    /* Verify pointer is within pool bounds */
+    if (ptr < pool->shared_memory ||
+        ptr >= (char *)pool->shared_memory + pool->shared_size) {
+        pr_warn("Attempt to free pointer outside pool %s bounds: %p\n",
+                pool->controller_pci, ptr);
+        return;
+    }
+
+    /* Update statistics */
+    atomic64_inc(&pool->total_deallocations);
+    atomic64_sub(size, &pool->bytes_allocated);
+
+    pr_debug("Pool %s freed %zu bytes (current usage: %lld bytes)\n",
+             pool->controller_pci, size, atomic64_read(&pool->bytes_allocated));
+}
+
+/**
+ * pool_reset - Reset a shared memory pool
+ * @pool: Pool to reset
+ *
+ * Resets allocation offset to 0, effectively freeing all memory.
+ * Should only be called when no devices are actively using pool memory.
+ */
+static void pool_reset(struct device_pool *pool)
+{
+    unsigned long flags;
+
+    if (!pool || !pool->active)
+        return;
+
+    spin_lock_irqsave(&pool->lock, flags);
+
+    atomic_set(&pool->allocation_offset, 0);
+    atomic64_set(&pool->bytes_allocated, 0);
+
+    spin_unlock_irqrestore(&pool->lock, flags);
+
+    pr_info("Pool %s reset (%zu MB available)\n",
+            pool->controller_pci, pool->shared_size / (1024 * 1024));
+}
+
+/**
+ * pool_get_stats - Get shared memory pool statistics
+ * @pool: Pool to get statistics from
+ * @total_allocs: Output for total allocation count
+ * @total_frees: Output for total deallocation count
+ * @bytes_used: Output for current bytes allocated
+ * @peak_bytes: Output for peak bytes allocated
+ */
+static void pool_get_stats(struct device_pool *pool, uint64_t *total_allocs,
+                          uint64_t *total_frees, uint64_t *bytes_used,
+                          uint64_t *peak_bytes)
+{
+    if (!pool || !pool->active)
+        return;
+
+    if (total_allocs)
+        *total_allocs = atomic64_read(&pool->total_allocations);
+    if (total_frees)
+        *total_frees = atomic64_read(&pool->total_deallocations);
+    if (bytes_used)
+        *bytes_used = atomic64_read(&pool->bytes_allocated);
+    if (peak_bytes)
+        *peak_bytes = atomic64_read(&pool->peak_usage);
+}
+
+/**
+ * pool_cache_firmware - Cache firmware in shared pool for multi-device reuse
+ * @pool: Pool to cache firmware in
+ * @data: Firmware data to cache
+ * @size: Size of firmware
+ * @crc: CRC32 of firmware for validation
+ *
+ * Returns 0 on success, negative error code on failure.
+ * If firmware is already cached with same CRC, increments refcount.
+ */
+static int pool_cache_firmware(struct device_pool *pool, const void *data,
+                               size_t size, uint32_t crc)
+{
+    unsigned long flags;
+    void *cached_copy;
+
+    if (!pool || !pool->active || !enable_memory_pooling || !pool->shared_memory)
+        return -ENODEV;
+
+    spin_lock_irqsave(&pool->lock, flags);
+
+    /* Check if firmware is already cached */
+    if (pool->cached_firmware &&
+        pool->cached_firmware_size == size &&
+        pool->cached_firmware_crc == crc) {
+        /* Firmware already cached, increment refcount */
+        atomic_inc(&pool->firmware_refcount);
+        spin_unlock_irqrestore(&pool->lock, flags);
+        pr_info("Firmware already cached in pool %s, refcount: %d\n",
+                pool->controller_pci, atomic_read(&pool->firmware_refcount));
+        return 0;
+    }
+
+    /* Need to cache new firmware */
+    if (pool->cached_firmware) {
+        /* Different firmware already cached, release it first */
+        pr_warn("Replacing cached firmware in pool %s (old CRC: 0x%08x, new CRC: 0x%08x)\n",
+                pool->controller_pci, pool->cached_firmware_crc, crc);
+        pool_free(pool, pool->cached_firmware, pool->cached_firmware_size);
+        pool->cached_firmware = NULL;
+    }
+
+    spin_unlock_irqrestore(&pool->lock, flags);
+
+    /* Allocate from pool (outside lock) */
+    cached_copy = pool_alloc(pool, size, 64);  /* 64-byte alignment for DMA */
+    if (!cached_copy) {
+        pr_err("Failed to allocate %zu bytes from pool %s for firmware cache\n",
+               size, pool->controller_pci);
+        return -ENOMEM;
+    }
+
+    /* Copy firmware data */
+    memcpy(cached_copy, data, size);
+
+    spin_lock_irqsave(&pool->lock, flags);
+    pool->cached_firmware = cached_copy;
+    pool->cached_firmware_size = size;
+    pool->cached_firmware_crc = crc;
+    atomic_set(&pool->firmware_refcount, 1);
+    spin_unlock_irqrestore(&pool->lock, flags);
+
+    pr_info("✓ Cached %zu KB firmware in pool %s (CRC: 0x%08x)\n",
+            size / 1024, pool->controller_pci, crc);
+
+    return 0;
+}
+
+/**
+ * pool_get_cached_firmware - Get pointer to cached firmware
+ * @pool: Pool to get cached firmware from
+ * @size: Output for firmware size
+ * @crc: Output for firmware CRC
+ *
+ * Returns pointer to cached firmware, or NULL if not cached.
+ * Caller should verify CRC matches expected value.
+ */
+static void *pool_get_cached_firmware(struct device_pool *pool, size_t *size,
+                                      uint32_t *crc)
+{
+    unsigned long flags;
+    void *firmware = NULL;
+
+    if (!pool || !pool->active)
+        return NULL;
+
+    spin_lock_irqsave(&pool->lock, flags);
+    if (pool->cached_firmware) {
+        firmware = pool->cached_firmware;
+        if (size)
+            *size = pool->cached_firmware_size;
+        if (crc)
+            *crc = pool->cached_firmware_crc;
+    }
+    spin_unlock_irqrestore(&pool->lock, flags);
+
+    return firmware;
+}
+
+/**
+ * pool_release_firmware - Decrement firmware refcount
+ * @pool: Pool to release firmware from
+ *
+ * When refcount reaches 0, firmware remains cached but can be replaced.
+ */
+static void pool_release_firmware(struct device_pool *pool)
+{
+    if (!pool || !pool->active)
+        return;
+
+    if (pool->cached_firmware && atomic_read(&pool->firmware_refcount) > 0) {
+        int refcount = atomic_dec_return(&pool->firmware_refcount);
+        pr_debug("Pool %s firmware refcount: %d\n", pool->controller_pci, refcount);
+    }
 }
 
 /* ========== Firmware Upload Helper Functions ========== */
@@ -2264,6 +3096,11 @@ static void urb_complete_callback(struct urb *urb)
     struct io_uring_cmd *cmd = ctx->cmd;
     int result;
 
+    /* Update bandwidth statistics for USB controller */
+    if (urb->status == 0 && urb->actual_length > 0) {
+        update_bandwidth_stats(dev->pool, urb->actual_length);
+    }
+
     /* Update statistics */
     if (urb->status == 0) {
         atomic64_inc(&dev->stats.total_inferences);
@@ -2871,6 +3708,205 @@ static struct kobj_attribute compute_utilization_attr = __ATTR_RO(compute_utiliz
 static struct kobj_attribute memory_bandwidth_attr = __ATTR_RO(memory_bandwidth);
 static struct kobj_attribute performance_mode_attr = __ATTR_RW(performance_mode);
 
+/* Shared Memory Pool Statistics */
+/* Shared Memory Pool Statistics (Per-Controller) */
+static ssize_t pool_total_allocations_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+    struct device_pool *pool = dev->pool;
+
+    return sprintf(buf, "%llu\n", pool ? atomic64_read(&pool->total_allocations) : 0);
+}
+
+static ssize_t pool_bytes_allocated_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+    struct device_pool *pool = dev->pool;
+
+    return sprintf(buf, "%lld\n", pool ? atomic64_read(&pool->bytes_allocated) : 0);
+}
+
+static ssize_t pool_peak_usage_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+    struct device_pool *pool = dev->pool;
+
+    return sprintf(buf, "%llu\n", pool ? atomic64_read(&pool->peak_usage) : 0);
+}
+
+static ssize_t pool_size_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+    struct device_pool *pool = dev->pool;
+
+    return sprintf(buf, "%zu\n", pool ? pool->shared_size : 0);
+}
+
+static ssize_t pool_utilization_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+    struct device_pool *pool = dev->pool;
+    uint64_t bytes_used;
+    uint32_t percent = 0;
+
+    if (!pool || pool->shared_size == 0)
+        return sprintf(buf, "0\n");
+
+    bytes_used = atomic64_read(&pool->bytes_allocated);
+    percent = (bytes_used * 100) / pool->shared_size;
+
+    return sprintf(buf, "%u\n", percent);
+}
+
+static ssize_t pool_cached_firmware_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+    struct device_pool *pool = dev->pool;
+    unsigned long flags;
+    int len = 0;
+
+    if (!pool)
+        return sprintf(buf, "no_pool\n");
+
+    spin_lock_irqsave(&pool->lock, flags);
+    if (pool->cached_firmware) {
+        len = sprintf(buf, "size=%zu crc=0x%08x refcount=%d\n",
+                     pool->cached_firmware_size,
+                     pool->cached_firmware_crc,
+                     atomic_read(&pool->firmware_refcount));
+    } else {
+        len = sprintf(buf, "none\n");
+    }
+    spin_unlock_irqsave(&pool->lock, flags);
+
+    return len;
+}
+
+/* USB Controller & IOMMU Topology */
+static ssize_t controller_pci_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+
+    return sprintf(buf, "%s\n", dev->controller_pci);
+}
+
+static ssize_t iommu_group_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+
+    return sprintf(buf, "%d\n", dev->iommu_group);
+}
+
+static ssize_t controller_pool_devices_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+    struct device_pool *pool = dev->pool;
+
+    if (!pool)
+        return sprintf(buf, "0\n");
+
+    return sprintf(buf, "%d\n", pool->device_count);
+}
+
+static ssize_t same_controller_steals_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+
+    return sprintf(buf, "%llu\n", atomic64_read(&dev->same_controller_steals));
+}
+
+static ssize_t cross_controller_steals_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+
+    return sprintf(buf, "%llu\n", atomic64_read(&dev->cross_controller_steals));
+}
+
+/* USB Bandwidth Monitoring */
+static ssize_t usb_bandwidth_current_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+    struct device_pool *pool = dev->pool;
+
+    return sprintf(buf, "%u\n", pool ? pool->current_bandwidth_mbps : 0);
+}
+
+static ssize_t usb_bandwidth_peak_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+    struct device_pool *pool = dev->pool;
+
+    return sprintf(buf, "%u\n", pool ? pool->peak_bandwidth_mbps : 0);
+}
+
+static ssize_t usb_bandwidth_utilization_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+    struct device_pool *pool = dev->pool;
+    uint32_t utilization = 0;
+
+    if (pool && pool->current_bandwidth_mbps > 0) {
+        utilization = (pool->current_bandwidth_mbps * 100) / USB_30_PRACTICAL_MBPS;
+    }
+
+    return sprintf(buf, "%u\n", utilization);
+}
+
+static ssize_t usb_bandwidth_warnings_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+    struct device_pool *pool = dev->pool;
+
+    return sprintf(buf, "%d\n", pool ? atomic_read(&pool->bandwidth_warnings) : 0);
+}
+
+static ssize_t controller_numa_node_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct device *parent_dev = kobj_to_dev(kobj->parent);
+    struct movidius_x_vpu_dev *dev = dev_get_drvdata(parent_dev);
+    struct device_pool *pool = dev->pool;
+
+    return sprintf(buf, "%d\n", pool ? pool->numa_node : -1);
+}
+
+static ssize_t hypervisor_type_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%s\n", hypervisor_type);
+}
+
+static struct kobj_attribute pool_total_allocations_attr = __ATTR_RO(pool_total_allocations);
+static struct kobj_attribute pool_bytes_allocated_attr = __ATTR_RO(pool_bytes_allocated);
+static struct kobj_attribute pool_peak_usage_attr = __ATTR_RO(pool_peak_usage);
+static struct kobj_attribute pool_size_attr = __ATTR_RO(pool_size);
+static struct kobj_attribute pool_utilization_attr = __ATTR_RO(pool_utilization);
+static struct kobj_attribute pool_cached_firmware_attr = __ATTR_RO(pool_cached_firmware);
+static struct kobj_attribute controller_pci_attr = __ATTR_RO(controller_pci);
+static struct kobj_attribute iommu_group_attr = __ATTR_RO(iommu_group);
+static struct kobj_attribute controller_pool_devices_attr = __ATTR_RO(controller_pool_devices);
+static struct kobj_attribute same_controller_steals_attr = __ATTR_RO(same_controller_steals);
+static struct kobj_attribute cross_controller_steals_attr = __ATTR_RO(cross_controller_steals);
+static struct kobj_attribute usb_bandwidth_current_attr = __ATTR_RO(usb_bandwidth_current);
+static struct kobj_attribute usb_bandwidth_peak_attr = __ATTR_RO(usb_bandwidth_peak);
+static struct kobj_attribute usb_bandwidth_utilization_attr = __ATTR_RO(usb_bandwidth_utilization);
+static struct kobj_attribute usb_bandwidth_warnings_attr = __ATTR_RO(usb_bandwidth_warnings);
+static struct kobj_attribute controller_numa_node_attr = __ATTR_RO(controller_numa_node);
+static struct kobj_attribute hypervisor_type_attr = __ATTR_RO(hypervisor_type);
+
 static struct attribute *movidius_attrs[] = {
     &total_inferences_attr.attr,
     &total_errors_attr.attr,
@@ -2884,6 +3920,23 @@ static struct attribute *movidius_attrs[] = {
     &compute_utilization_attr.attr,
     &memory_bandwidth_attr.attr,
     &performance_mode_attr.attr,
+    &pool_total_allocations_attr.attr,
+    &pool_bytes_allocated_attr.attr,
+    &pool_peak_usage_attr.attr,
+    &pool_size_attr.attr,
+    &pool_utilization_attr.attr,
+    &pool_cached_firmware_attr.attr,
+    &controller_pci_attr.attr,
+    &iommu_group_attr.attr,
+    &controller_pool_devices_attr.attr,
+    &same_controller_steals_attr.attr,
+    &cross_controller_steals_attr.attr,
+    &usb_bandwidth_current_attr.attr,
+    &usb_bandwidth_peak_attr.attr,
+    &usb_bandwidth_utilization_attr.attr,
+    &usb_bandwidth_warnings_attr.attr,
+    &controller_numa_node_attr.attr,
+    &hypervisor_type_attr.attr,
     NULL,
 };
 
@@ -3071,16 +4124,20 @@ static int movidius_platform_probe(struct platform_device *pdev)
     /* Initialize multi-device coordination */
     atomic64_set(&dev->stolen_tasks, 0);
     atomic64_set(&dev->donated_tasks, 0);
+    atomic64_set(&dev->same_controller_steals, 0);
+    atomic64_set(&dev->cross_controller_steals, 0);
     dev->pool = NULL;
+    dev->controller_id = -1;
+    dev->iommu_group = -1;
+    dev->usb_busnum = -1;
+    snprintf(dev->controller_pci, sizeof(dev->controller_pci), "unknown");
 
-    /* Add device to global pool for multi-device coordination */
+    /* Add device to controller pool for multi-device coordination */
     ret = add_device_to_pool(dev);
     if (ret < 0 && ret != -ENOSPC) {
         dev_warn(&pdev->dev, "Failed to add device to pool: %d\n", ret);
-    } else if (ret == 0) {
-        dev_info(&pdev->dev, "✓ Added to device pool (pool has %d device(s))\n",
-                 global_pool.device_count);
     }
+    /* Success message already printed by add_device_to_pool() */
 
     /* Enable runtime PM */
     pm_runtime_set_active(&pdev->dev);
@@ -3268,18 +4325,24 @@ static struct usb_driver movidius_x_vpu_driver = {
 
 static int __init movidius_x_vpu_init(void)
 {
-    int ret;
+    int ret, i;
 
-    /* Initialize global device pool */
-    spin_lock_init(&global_pool.lock);
-    INIT_LIST_HEAD(&global_pool.global_work_queue);
-    spin_lock_init(&global_pool.work_queue_lock);
-    init_waitqueue_head(&global_pool.work_available);
-    atomic_set(&global_pool.allocation_offset, 0);
-    atomic_set(&global_pool.round_robin_index, 0);
-    atomic64_set(&global_pool.total_migrations, 0);
-    atomic64_set(&global_pool.total_stolen, 0);
-    atomic64_set(&global_pool.pool_throughput, 0);
+    /* Detect hypervisor for virtualization optimizations */
+    detect_hypervisor();
+
+    /* Initialize per-controller device pools (allocated on-demand) */
+    for (i = 0; i < MAX_USB_CONTROLLERS; i++) {
+        controller_pools[i].active = false;
+        controller_pools[i].device_count = 0;
+        controller_pools[i].shared_memory = NULL;
+    }
+    active_controller_count = 0;
+
+    pr_info("DMA-topology-aware driver: Per-controller pools (max %d controllers)\n",
+            MAX_USB_CONTROLLERS);
+    if (numa_available) {
+        pr_info("NUMA-aware memory allocation enabled\n");
+    }
 
     ret = alloc_chrdev_region(&movidius_devt, 0, MAX_DEVICES, DRIVER_NAME);
     if (ret) {
@@ -3335,12 +4398,37 @@ static int __init movidius_x_vpu_init(void)
 
 static void __exit movidius_x_vpu_exit(void)
 {
+    int i;
+
     usb_deregister(&movidius_x_vpu_driver);
     platform_driver_unregister(&movidius_platform_driver);
     class_destroy(movidius_class);
     unregister_chrdev_region(movidius_devt, MAX_DEVICES);
     ida_destroy(&movidius_minor_ida);
-    pr_info(DRIVER_NAME " driver unloaded\n");
+
+    /* Free all controller pools and print statistics */
+    pr_info("Per-controller pool cleanup:\n");
+    for (i = 0; i < MAX_USB_CONTROLLERS; i++) {
+        struct device_pool *pool = &controller_pools[i];
+
+        if (!pool->active)
+            continue;
+
+        if (pool->shared_memory) {
+            pr_info("Pool %d (%s): %lld allocs, peak %llu bytes (%.1f%%)\n",
+                    i, pool->controller_pci,
+                    atomic64_read(&pool->total_allocations),
+                    atomic64_read(&pool->peak_usage),
+                    (atomic64_read(&pool->peak_usage) * 100.0) / pool->shared_size);
+
+            vfree(pool->shared_memory);
+            pool->shared_memory = NULL;
+            pr_info("✓ Freed 64MB pool for controller %s\n", pool->controller_pci);
+        }
+        pool->active = false;
+    }
+
+    pr_info(DRIVER_NAME " driver unloaded (%d controllers served)\n", active_controller_count);
 }
 
 module_init(movidius_x_vpu_init);
