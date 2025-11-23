@@ -11,6 +11,13 @@
 #include <linux/interrupt.h>
 #include <linux/version.h>
 
+#if defined(__same_type)
+#define VFIO_PLATFORM_REMOVE_RETURNS_VOID \
+	__same_type(((struct platform_driver *)0)->remove, void (*)(struct platform_device *))
+#else
+#define VFIO_PLATFORM_REMOVE_RETURNS_VOID 0
+#endif
+
 #define DRIVER_NAME "vfio_movidius"
 #define MOVIDIUS_VFIO_VERSION 1
 
@@ -529,7 +536,11 @@ err_free:
     return ret;
 }
 
+#if VFIO_PLATFORM_REMOVE_RETURNS_VOID
+static void vfio_movidius_remove(struct platform_device *pdev)
+#else
 static int vfio_movidius_remove(struct platform_device *pdev)
+#endif
 {
     struct vfio_movidius_dev *vdev = platform_get_drvdata(pdev);
 
@@ -539,7 +550,9 @@ static int vfio_movidius_remove(struct platform_device *pdev)
 #endif
 
     dev_info(&pdev->dev, "VFIO Movidius driver removed\n");
+#if !VFIO_PLATFORM_REMOVE_RETURNS_VOID
     return 0;
+#endif
 }
 
 static const struct platform_device_id vfio_movidius_ids[] = {

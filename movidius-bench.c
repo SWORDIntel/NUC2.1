@@ -440,7 +440,9 @@ int test_single_inference(struct io_uring *ring, void *dma_buffer, int device_id
         return -1;
     }
 
-    io_uring_prep_cmd(sqe, MOVIDIUS_URING_CMD_SUBMIT_INFERENCE, fds[device_idx]);
+    sqe->opcode = IORING_OP_URING_CMD;
+    sqe->fd = fds[device_idx];
+    sqe->cmd_op = MOVIDIUS_URING_CMD_SUBMIT_INFERENCE;
     sqe->addr = (uint64_t)(uintptr_t)&req;
     sqe->len = sizeof(req);
     io_uring_sqe_set_data(sqe, (void *)1);
@@ -524,7 +526,9 @@ int test_batch_inference(struct io_uring *ring, void *dma_buffer, int batch_size
             return -1;
         }
 
-        io_uring_prep_cmd(sqe, MOVIDIUS_URING_CMD_SUBMIT_BATCH, fds[j % num_devices]);
+        sqe->opcode = IORING_OP_URING_CMD;
+        sqe->fd = fds[j % num_devices];
+        sqe->cmd_op = MOVIDIUS_URING_CMD_SUBMIT_BATCH;
         sqe->addr = (uint64_t)(uintptr_t)&batch_req;
         sqe->len = sizeof(batch_req);
         io_uring_sqe_set_data(sqe, (void *)2);
@@ -622,7 +626,9 @@ int test_stress(struct io_uring *ring, void *dma_buffer, int duration_sec) {
             continue;
         }
 
-        io_uring_prep_cmd(sqe, MOVIDIUS_URING_CMD_SUBMIT_INFERENCE, fds[iterations % num_devices]);
+        sqe->opcode = IORING_OP_URING_CMD;
+        sqe->fd = fds[iterations % num_devices];
+        sqe->cmd_op = MOVIDIUS_URING_CMD_SUBMIT_INFERENCE;
         sqe->addr = (uint64_t)(uintptr_t)&req;
         sqe->len = sizeof(req);
 

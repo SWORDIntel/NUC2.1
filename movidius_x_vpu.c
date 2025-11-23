@@ -23,6 +23,7 @@
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
 #include <linux/zlib.h>
+#include <linux/vmalloc.h>
 
 /* io_uring_cmd support - provides async zero-copy inference submission
  *
@@ -39,12 +40,20 @@
 
 #if MOVIDIUS_ENABLE_IO_URING && defined(CONFIG_IO_URING) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
 #include <linux/io_uring.h>
+#include <linux/io_uring/cmd.h>
 #define HAS_URING_CMD 1
 #endif
 
 #ifndef HAS_URING_CMD
 /* Forward declaration for pointer type when io_uring not available */
 struct io_uring_cmd;
+#endif
+
+#if defined(__same_type)
+#define PLATFORM_REMOVE_RETURNS_VOID \
+	__same_type(((struct platform_driver *)0)->remove, void (*)(struct platform_device *))
+#else
+#define PLATFORM_REMOVE_RETURNS_VOID 0
 #endif
 
 #define DRIVER_NAME "movidius_x_vpu"
@@ -298,7 +307,11 @@ MODULE_PARM_DESC(max_temperature, "Maximum temperature before throttle (75-105°
 
 /* Forward declarations (basic functions before struct definitions) */
 static int movidius_platform_probe(struct platform_device *pdev);
+#if PLATFORM_REMOVE_RETURNS_VOID
+static void movidius_platform_remove(struct platform_device *pdev);
+#else
 static int movidius_platform_remove(struct platform_device *pdev);
+#endif
 #ifdef HAS_URING_CMD
 static int movidius_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags);
 #endif
@@ -1655,7 +1668,7 @@ static int add_device_to_pool(struct movidius_x_vpu_dev *dev)
     }
 
 out:
-    spin_unlock_irqsave(&pool->lock, flags);
+    spin_unlock_irqrestore(&pool->lock, flags);
     return ret;
 }
 
@@ -1687,7 +1700,7 @@ static void remove_device_from_pool(struct movidius_x_vpu_dev *dev)
         }
     }
 
-    spin_unlock_irqsave(&pool->lock, flags);
+    spin_unlock_irqrestore(&pool->lock, flags);
     dev->pool = NULL;
 }
 
@@ -3783,7 +3796,7 @@ static ssize_t pool_cached_firmware_show(struct kobject *kobj, struct kobj_attri
     } else {
         len = sprintf(buf, "none\n");
     }
-    spin_unlock_irqsave(&pool->lock, flags);
+    spin_unlock_irqrestore(&pool->lock, flags);
 
     return len;
 }
@@ -4170,7 +4183,11 @@ err_out:
     return ret;
 }
 
+#if PLATFORM_REMOVE_RETURNS_VOID
+static void movidius_platform_remove(struct platform_device *pdev)
+#else
 static int movidius_platform_remove(struct platform_device *pdev)
+#endif
 {
     struct movidius_x_vpu_dev *dev = platform_get_drvdata(pdev);
 
@@ -4216,7 +4233,9 @@ static int movidius_platform_remove(struct platform_device *pdev)
 
     atomic_dec(&global_device_count);
     dev_info(&pdev->dev, "Platform device unregistered successfully\n");
+#if !PLATFORM_REMOVE_RETURNS_VOID
     return 0;
+#endif
 }
 
 /* ========== USB Driver ========== */
