@@ -23,6 +23,7 @@
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
 #include <linux/zlib.h>
+#include <linux/time.h>
 #include <linux/vmalloc.h>
 
 /* io_uring_cmd support - provides async zero-copy inference submission
@@ -49,9 +50,8 @@
 struct io_uring_cmd;
 #endif
 
-#if defined(__same_type)
-#define PLATFORM_REMOVE_RETURNS_VOID \
-	__same_type(((struct platform_driver *)0)->remove, void (*)(struct platform_device *))
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+#define PLATFORM_REMOVE_RETURNS_VOID 1
 #else
 #define PLATFORM_REMOVE_RETURNS_VOID 0
 #endif
@@ -802,8 +802,8 @@ static int set_core_voltage(struct movidius_x_vpu_dev *dev, uint32_t voltage_mv)
         return ret;
     }
 
-    dev_info(dev->dev, "✓ Core voltage set to %u mV (%.2fV)\n",
-             voltage_mv, voltage_mv / 1000.0);
+    dev_info(dev->dev, "✓ Core voltage set to %u mV (%u.%03u V)\n",
+             voltage_mv, voltage_mv / 1000, voltage_mv % 1000);
 
     return 0;
 }
@@ -1031,7 +1031,7 @@ static int apply_extreme_profile(struct movidius_x_vpu_dev *dev)
 /* ========== Multi-Device Work Stealing ========== */
 
 /* Find least loaded device in pool */
-static struct movidius_x_vpu_dev *find_least_loaded_device(struct device_pool *pool)
+static __maybe_unused struct movidius_x_vpu_dev *find_least_loaded_device(struct device_pool *pool)
 {
     struct movidius_x_vpu_dev *best_dev = NULL;
     uint64_t min_queue = ~0ULL;  /* Maximum uint64_t value */
@@ -1784,8 +1784,8 @@ static void pool_free(struct device_pool *pool, void *ptr, size_t size)
         return;
 
     /* Verify pointer is within pool bounds */
-    if (ptr < pool->shared_memory ||
-        ptr >= (char *)pool->shared_memory + pool->shared_size) {
+    if ((char *)ptr < (char *)pool->shared_memory ||
+        (char *)ptr >= (char *)pool->shared_memory + pool->shared_size) {
         pr_warn("Attempt to free pointer outside pool %s bounds: %p\n",
                 pool->controller_pci, ptr);
         return;
@@ -1806,7 +1806,7 @@ static void pool_free(struct device_pool *pool, void *ptr, size_t size)
  * Resets allocation offset to 0, effectively freeing all memory.
  * Should only be called when no devices are actively using pool memory.
  */
-static void pool_reset(struct device_pool *pool)
+static __maybe_unused void pool_reset(struct device_pool *pool)
 {
     unsigned long flags;
 
@@ -1832,7 +1832,7 @@ static void pool_reset(struct device_pool *pool)
  * @bytes_used: Output for current bytes allocated
  * @peak_bytes: Output for peak bytes allocated
  */
-static void pool_get_stats(struct device_pool *pool, uint64_t *total_allocs,
+static __maybe_unused void pool_get_stats(struct device_pool *pool, uint64_t *total_allocs,
                           uint64_t *total_frees, uint64_t *bytes_used,
                           uint64_t *peak_bytes)
 {
@@ -1859,7 +1859,7 @@ static void pool_get_stats(struct device_pool *pool, uint64_t *total_allocs,
  * Returns 0 on success, negative error code on failure.
  * If firmware is already cached with same CRC, increments refcount.
  */
-static int pool_cache_firmware(struct device_pool *pool, const void *data,
+static __maybe_unused int pool_cache_firmware(struct device_pool *pool, const void *data,
                                size_t size, uint32_t crc)
 {
     unsigned long flags;
@@ -1926,7 +1926,7 @@ static int pool_cache_firmware(struct device_pool *pool, const void *data,
  * Returns pointer to cached firmware, or NULL if not cached.
  * Caller should verify CRC matches expected value.
  */
-static void *pool_get_cached_firmware(struct device_pool *pool, size_t *size,
+static __maybe_unused void *pool_get_cached_firmware(struct device_pool *pool, size_t *size,
                                       uint32_t *crc)
 {
     unsigned long flags;
@@ -1954,7 +1954,7 @@ static void *pool_get_cached_firmware(struct device_pool *pool, size_t *size,
  *
  * When refcount reaches 0, firmware remains cached but can be replaced.
  */
-static void pool_release_firmware(struct device_pool *pool)
+static __maybe_unused void pool_release_firmware(struct device_pool *pool)
 {
     if (!pool || !pool->active)
         return;
@@ -2152,9 +2152,17 @@ static int decompress_firmware(struct movidius_x_vpu_dev *dev,
     zlib_inflateEnd(&stream);
     vfree(stream.workspace);
 
-    dev_info(dev->dev, "✓ Firmware decompressed: %zu -> %lu bytes (%.1f%% compression)\n",
-             compressed_size, stream.total_out,
-             (1.0 - ((double)compressed_size / stream.total_out)) * 100.0);
+    {
+        u64 savings_tenths = 0;
+        if (stream.total_out > 0) {
+            u64 saved = stream.total_out - compressed_size;
+            savings_tenths = (saved * 1000) / stream.total_out;
+        }
+
+        dev_info(dev->dev, "✓ Firmware decompressed: %zu -> %lu bytes (%llu.%01llu%% compression)\n",
+                 compressed_size, stream.total_out,
+                 savings_tenths / 10, savings_tenths % 10);
+    }
 
     *decompressed_data = output;
     return 0;
@@ -3404,7 +3412,8 @@ static int movidius_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags
     switch (cmd->cmd_op) {
     case MOVIDIUS_URING_CMD_SUBMIT_INFERENCE:
         {
-            struct inference_request __user *user_req = (void __user *)cmd->cmd;
+            const void __user *user_cmd = io_uring_sqe_cmd(cmd->sqe);
+            struct inference_request __user *user_req = (struct inference_request __user *)user_cmd;
             struct inference_request req;
 
             if (copy_from_user(&req, user_req, sizeof(req))) {
@@ -3436,7 +3445,8 @@ static int movidius_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags
 
     case MOVIDIUS_URING_CMD_SUBMIT_BATCH:
         {
-            struct batch_inference_request __user *user_batch = (void __user *)cmd->cmd;
+            const void __user *user_cmd = io_uring_sqe_cmd(cmd->sqe);
+            struct batch_inference_request __user *user_batch = (struct batch_inference_request __user *)user_cmd;
             struct batch_inference_request batch;
             struct inference_request __user *user_reqs;
             int i;
@@ -4080,8 +4090,7 @@ static int movidius_platform_probe(struct platform_device *pdev)
     INIT_LIST_HEAD(&dev->request_queue);
     init_waitqueue_head(&dev->request_queue_wait);
 
-    hrtimer_init(&dev->batch_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-    dev->batch_timer.function = batch_timer_callback;
+    hrtimer_setup(&dev->batch_timer, batch_timer_callback, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     dev->timer_pending = false;
 
     dev->submission_thread = kthread_run(submission_kthread, dev, "movidius-submit-%d", dev->minor);
@@ -4434,11 +4443,15 @@ static void __exit movidius_x_vpu_exit(void)
             continue;
 
         if (pool->shared_memory) {
-            pr_info("Pool %d (%s): %lld allocs, peak %llu bytes (%.1f%%)\n",
-                    i, pool->controller_pci,
-                    atomic64_read(&pool->total_allocations),
-                    atomic64_read(&pool->peak_usage),
-                    (atomic64_read(&pool->peak_usage) * 100.0) / pool->shared_size);
+            {
+                u64 peak = atomic64_read(&pool->peak_usage);
+                u64 tenths = (peak * 1000) / pool->shared_size;
+                pr_info("Pool %d (%s): %lld allocs, peak %llu bytes (%llu.%01llu%%)\n",
+                        i, pool->controller_pci,
+                        atomic64_read(&pool->total_allocations),
+                        peak,
+                        tenths / 10, tenths % 10);
+            }
 
             vfree(pool->shared_memory);
             pool->shared_memory = NULL;

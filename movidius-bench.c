@@ -10,6 +10,7 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <limits.h>
 #include <math.h>
 
 /* Conditionally include liburing if available */
@@ -153,7 +154,7 @@ static void print_metrics(struct perf_metrics *metrics) {
 }
 
 static void read_sysfs_stats(int device_idx) {
-    char path[256];
+    char path[PATH_MAX];
     FILE *fp;
     long long value;
 
@@ -215,7 +216,10 @@ void find_devices(void) {
         while ((dir = readdir(d)) != NULL) {
             if (strncmp(dir->d_name, "movidius_x_vpu", 14) == 0) {
                 if (num_devices < MAX_DEVICES) {
-                    snprintf(path, sizeof(path), "/dev/%s", dir->d_name);
+                    /* Guard against overly long names to avoid truncation warnings */
+                    if (snprintf(path, sizeof(path), "/dev/%s", dir->d_name) >= (int)sizeof(path)) {
+                        continue;
+                    }
                     fds[num_devices] = open(path, O_RDWR);
                     if (fds[num_devices] >= 0) {
                         printf("✓ Opened %s (fd=%d)\n", path, fds[num_devices]);
@@ -596,6 +600,7 @@ int test_stress(struct io_uring *ring, void *dma_buffer, int duration_sec) {
     struct perf_metrics metrics = {0};
     uint64_t start_time, end_time, current_time;
     int iterations = 0;
+    (void)dma_buffer;
 
     print_separator();
     printf("Stress Test (Duration: %d seconds)\n", duration_sec);
@@ -606,7 +611,7 @@ int test_stress(struct io_uring *ring, void *dma_buffer, int duration_sec) {
 
     while (1) {
         current_time = get_time_ns();
-        if ((current_time - start_time) / 1000000000ULL >= duration_sec) {
+        if ((current_time - start_time) / 1000000000ULL >= (uint64_t)duration_sec) {
             break;
         }
 
@@ -695,6 +700,8 @@ int main(int argc, char *argv[]) {
 #endif
     int ret;
     void *dma_buffer;
+    (void)argc;
+    (void)argv;
 
     printf("Movidius Myriad X VPU Driver Test Suite\n");
 #if HAS_LIBURING

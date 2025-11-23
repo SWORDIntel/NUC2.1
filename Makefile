@@ -49,14 +49,14 @@ movidius-bench: movidius-bench.c
 ifeq ($(ENABLE_IO_URING),1)
 ifeq ($(HAS_LIBURING),1)
 	@echo "Building movidius-bench with io_uring support..."
-	gcc movidius-bench.c -o movidius-bench -luring -O2 -Wall -Wextra -DHAS_LIBURING=1
+	gcc movidius-bench.c -o movidius-bench -luring -lm -O2 -Wall -Wextra -DHAS_LIBURING=1
 else
 	@echo "Building movidius-bench in ioctl-only mode (liburing not available)..."
-	gcc movidius-bench.c -o movidius-bench -O2 -Wall -Wextra -DHAS_LIBURING=0
+	gcc movidius-bench.c -o movidius-bench -lm -O2 -Wall -Wextra -DHAS_LIBURING=0
 endif
 else
 	@echo "Building movidius-bench in ioctl-only mode (io_uring disabled)..."
-	gcc movidius-bench.c -o movidius-bench -O2 -Wall -Wextra -DHAS_LIBURING=0
+	gcc movidius-bench.c -o movidius-bench -lm -O2 -Wall -Wextra -DHAS_LIBURING=0
 endif
 
 install:

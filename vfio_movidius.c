@@ -11,9 +11,8 @@
 #include <linux/interrupt.h>
 #include <linux/version.h>
 
-#if defined(__same_type)
-#define VFIO_PLATFORM_REMOVE_RETURNS_VOID \
-	__same_type(((struct platform_driver *)0)->remove, void (*)(struct platform_device *))
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+#define VFIO_PLATFORM_REMOVE_RETURNS_VOID 1
 #else
 #define VFIO_PLATFORM_REMOVE_RETURNS_VOID 0
 #endif
