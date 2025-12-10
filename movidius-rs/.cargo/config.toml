@@ -1,0 +1,34 @@
+# Cargo configuration for Meteor Lake optimizations
+# Intel Core Ultra 7 165H (Meteor Lake) - Optimal target features
+
+[build]
+# Use all available CPU cores for parallel compilation
+jobs = 16
+
+[target.x86_64-unknown-linux-gnu]
+# Meteor Lake CPU target with optimal feature set
+# These features are selected from your system's capabilities
+rustflags = [
+    "-C", "target-cpu=meteorlake",
+    "-C", "opt-level=3",
+    "-C", "lto=fat",
+    "-C", "codegen-units=1",
+    "-C", "target-feature=+avx2,+fma,+aes,+vaes,+pclmul,+vpclmulqdq,+sha,+gfni,+avxvnni,+avxvnniint8,+avxifma,+avxneconvert,+bmi1,+bmi2,+lzcnt,+popcnt,+movbe,+rdrand,+rdseed,+fsgsbase,+xsave,+xsaveopt,+xsavec,+xsaves,+invpcid,+kl,+widekl,+shstk,+ibt",
+]
+
+# Alternative: Use native detection (auto-detects all CPU features)
+# Uncomment below and comment above if you prefer auto-detection
+# rustflags = ["-C", "target-cpu=native", "-C", "opt-level=3", "-C", "lto=fat"]
+
+[profile.release]
+# Already optimized in workspace Cargo.toml, but ensure consistency
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true
+strip = false
