@@ -2,7 +2,6 @@
 
 [![Build and Test](https://github.com/SWORDIntel/NUC2.1/actions/workflows/build.yml/badge.svg)](https://github.com/SWORDIntel/NUC2.1/actions/workflows/build.yml)
 [![Docker](https://img.shields.io/badge/docker-automated-blue)](https://github.com/SWORDIntel/NUC2.1/pkgs/container/nuc2.1)
-[![License: GPL-2.0](https://img.shields.io/badge/License-GPL%202.0-blue.svg)](LICENSE)
 
 High-performance Linux kernel driver and Rust NCAPI v2 implementation for Intel Movidius Myriad X VPU (Neural Compute Stick 2), designed for low-latency, high-throughput deep learning inference with comprehensive monitoring and analytics.
 
@@ -842,3 +841,7 @@ Contributions welcome! Key areas:
 - ✅ Comprehensive integration test suite (`make test`)
 - ✅ Graceful liburing fallback in Makefile
 - ✅ Production-ready error handling and retry logic
+
+## License
+
+This project's SWORD-owned code is licensed under the **SWORD Restricted Source Licence v1.0 (SRSL-1.0)**. Personal and non-commercial use is permitted under its terms; commercial exploitation requires a separate written agreement. Third-party components retain their own licences. See [LICENSE](LICENSE).
