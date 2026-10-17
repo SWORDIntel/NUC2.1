@@ -758,8 +758,9 @@ Contributions welcome! Key areas:
 
 ## License
 
-- **Kernel Driver**: GNU General Public License v2.0 (GPL-2.0)
-- **Rust Components**: MIT OR Apache-2.0
+**Current first-party release:** SWORD Restricted Source Licence v1.1 (SRSL-1.1), including the out-of-tree kernel drivers and Rust workspace. See [LICENSE](LICENSE) and [licensing and compatibility notes](docs/SRSL_MIGRATION.md).
+
+Earlier distributions carried GPL-2.0 kernel-driver and MIT OR Apache-2.0 Rust grants; any rights validly granted under those terms remain effective for those earlier copies. The new proprietary kernel-module declarations can taint the running kernel and prevent linking to GPL-only symbols. Validate against your target kernel before deployment.
 
 ## Authors
 
@@ -844,4 +845,4 @@ Contributions welcome! Key areas:
 
 ## License
 
-This project's SWORD-owned code is licensed under the **SWORD Restricted Source Licence v1.0 (SRSL-1.0)**. Personal and non-commercial use is permitted under its terms; commercial exploitation requires a separate written agreement. Third-party components retain their own licences. See [LICENSE](LICENSE).
+Original SWORD-owned NUC2.1 source in this revision is offered under **SRSL-1.1**, a source-available (not OSI open-source) licence. Commercial use requires a separately executed agreement. The previous licence text is archived in [LICENSES/SRSL-1.0.txt](LICENSES/SRSL-1.0.txt). Historical GPL/MIT/Apache rights for already issued copies and independent third-party components remain intact. See [LICENSE](LICENSE) and [licensing notes](docs/SRSL_MIGRATION.md).
