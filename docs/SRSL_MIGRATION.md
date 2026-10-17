@@ -22,7 +22,7 @@ If kernel integration breaks, **do not falsify `MODULE_LICENSE`**: use an older,
 
 ## Rust workspace and third parties
 
-The Rust workspace now declares `license = "LicenseRef-SRSL-1.1"`, inherited by the three crates. All ordinary dependencies retain their independent original terms; no third-party software or firmware is relicensed here. `movidius-rs/README.md` and `movidius-rs/movidius-ncapi/README.md` reflect the same version.
+The Rust workspace uses `license-file = "../LICENSE"` (relative to its root), inherited via `license-file.workspace = true` by its three member crates. This follows Cargo's supported nonstandard-licence mechanism and ensures the full SRSL-1.1 text is included in packaged crates. The SPDX source-code identifier remains `LicenseRef-SRSL-1.1`. All ordinary dependencies retain their independent original terms; no third-party software or firmware is relicensed here. `movidius-rs/README.md` and `movidius-rs/movidius-ncapi/README.md` reflect the same version.
 
 ## Commercial use and model training
 
