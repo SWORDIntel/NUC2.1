@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LicenseRef-SRSL-1.1 */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/platform_device.h>
@@ -571,7 +572,7 @@ static struct platform_driver vfio_movidius_driver = {
 
 module_platform_driver(vfio_movidius_driver);
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("Proprietary");
 MODULE_AUTHOR("Jules");
 MODULE_DESCRIPTION("VFIO platform driver for Movidius Myriad X VPU with full DMA, IRQ, and mmap support");
 MODULE_VERSION("2.0");
