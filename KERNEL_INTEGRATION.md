@@ -1,4 +1,7 @@
 # Kernel Integration Guide
+
+> **LICENSING / KERNEL COMPATIBILITY WARNING (2026-10-17):** The current out-of-tree drivers are SRSL-1.1 (non-GPL-compatible) and declare `MODULE_LICENSE("Proprietary")`. This document is a historical integration design, **not** permission to incorporate that SRSL-only code into a GPL-licensed Linux kernel tree. The sample Kconfig/Makefile SPDX markers below describe only newly authored example configuration files, not a valid licence conversion of the driver. A separately authorised GPL-compatible driver release is necessary for in-tree use. Out-of-tree proprietary modules can taint the kernel and fail linkage to GPL-only exports; follow [the migration and validation notes](docs/SRSL_MIGRATION.md). Do not change metadata back to GPL solely to bypass kernel export checks.
+
 ## Movidius Myriad X VPU Driver
 
 This guide explains how to integrate the Movidius Myriad X VPU driver directly into the Linux kernel source tree instead of building it as an out-of-tree module.

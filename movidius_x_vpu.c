@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LicenseRef-SRSL-1.1 */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/usb.h>
@@ -4466,7 +4467,7 @@ static void __exit movidius_x_vpu_exit(void)
 module_init(movidius_x_vpu_init);
 module_exit(movidius_x_vpu_exit);
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("Proprietary");
 MODULE_AUTHOR("Jules");
 MODULE_DESCRIPTION("High-performance driver for Intel Movidius Myriad X VPU with io_uring, zero-copy DMA, adaptive batching, firmware loading, runtime PM, thermal monitoring, and hardware performance counters");
 MODULE_VERSION("2.1");

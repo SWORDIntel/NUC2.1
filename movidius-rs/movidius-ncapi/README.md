@@ -90,4 +90,4 @@ fn main() -> Result<()> {
 
 ## License
 
-MIT OR Apache-2.0
+SRSL-1.1 (LicenseRef-SRSL-1.1); previous valid MIT/Apache-2.0 grants for older copies are unaffected
